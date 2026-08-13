@@ -56,23 +56,24 @@ python3 ~/.codex/skills/codex-agentic-trader/scripts/test_codex_trader.py
 ## Robinhood 接入前提
 
 1. 在 `policy/policy.json` 配置账户末四位、资金上限与策略参数。
-2. 完整账户号只能由模型外的固定账户 adapter 注入，或由用户在当次任务中明确提供；不得用 `get_accounts` 枚举后猜默认账户。
-3. 将 Robinhood MCP 的 `enabled_tools` 精确锁定为 `policy/enabled_tools_live.json`，然后运行：
+2. research 只需要 Robinhood 的账户无关市场工具；不要为了 research 或 shadow 提前开放账户读写工具。
+3. shadow 应提供一个名为 `robinhood-account-readonly` 的本地 MCP，只发布零参数 `get_strategy_snapshot`，并在模型外注入固定账户、分页读取、递归脱敏且固定返回 `trade_readiness=false`。本公开仓不附带任何个人账户 provisioning 或 pin；完整账户号不得进入 prompt、配置、Git，也不得用 `get_accounts` 枚举猜默认账户。
+4. shadow 运行至少 10 个完整交易日，验证快照分页、advanced order 覆盖、部分成交、取消竞态、买卖力、wash sale、日志与回滚。
+5. 只有准备进入 `supervised_review` 时，才将 Robinhood MCP 的 `enabled_tools` 精确锁定为 `policy/enabled_tools_live.json`，然后运行：
 
 ```bash
 codex mcp get robinhood-trading --json \
   | python3 ~/.codex/skills/codex-agentic-trader/scripts/runtime_scope_gate_live.py
 ```
 
-4. shadow 运行至少 10 个完整交易日，验证快照分页、advanced order 覆盖、部分成交、取消竞态、买卖力、wash sale、日志与回滚。
-5. 如确需监督式执行，由账户所有人在本地签发短期 mandate：
+6. 如确需监督式执行，由账户所有人在本地签发短期 mandate：
 
 ```bash
 python3 ~/.codex/skills/codex-agentic-trader/scripts/mandate_admin.py create \
   --days 7 --max-order 300 --max-daily-turnover 750 --max-orders 3
 ```
 
-6. 每笔仍先 `review_equity_order`，展示 Robinhood 返回的完整审核和原样 `market_data_disclosure`，取得明确确认后才可 `place_equity_order`。
+7. 每笔仍先 `review_equity_order`，展示 Robinhood 返回的完整审核和原样 `market_data_disclosure`，取得明确确认后才可 `place_equity_order`。
 
 ## 当前已知边界
 

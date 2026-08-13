@@ -352,6 +352,16 @@ class OrderLedgerTests(unittest.TestCase):
                 "observed_at_et": (NOW + timedelta(minutes=1)).isoformat()})
 
 
+class SkillContractTests(unittest.TestCase):
+    def test_shadow_uses_zero_argument_account_bound_snapshot(self):
+        skill = (Path(__file__).parents[1] / "SKILL.md").read_text()
+        self.assertIn("robinhood-account-readonly", skill)
+        self.assertIn("get_strategy_snapshot", skill)
+        self.assertIn("不得传任何参数", skill)
+        self.assertIn("trade_readiness=false", skill)
+        self.assertIn("不得改用 `get_accounts`", skill)
+
+
 class RuntimeScopeTests(unittest.TestCase):
     def config(self, tools=None):
         expected = json.loads(live_gate.TOOLSET_PATH.read_text())["expected_tools"]

@@ -34,11 +34,16 @@ TTY 输入只是一个慎重的签发仪式，不能证明“Agent 无法自己�
 ### 0. 边界自检
 
 ```bash
-codex mcp get robinhood-trading --json | python3 scripts/runtime_scope_gate_live.py
 python3 scripts/live_gate.py --check-runtime
 ```
 
-工具面不符、mandate 无效或 HALT 存在时，不得执行新增风险订单。`runtime_scope_gate_live.py` 只校验工具面，不证明账户绑定。
+若返回 `mode_if_run_now=shadow`，只允许市场研究和下方固定账户只读快照，不要求、也不得为此开放 live 工具面。只有准备进入 `supervised_review` 时才运行：
+
+```bash
+codex mcp get robinhood-trading --json | python3 scripts/runtime_scope_gate_live.py
+```
+
+live 工具面不符、mandate 无效或 HALT 存在时，不得执行新增风险订单。`runtime_scope_gate_live.py` 只校验 live 工具面，不证明账户绑定。
 
 ### 1. 确定时间与交易日
 
@@ -47,6 +52,10 @@ python3 scripts/live_gate.py --check-runtime
 ### 2. 读取精确账户，绝不枚举
 
 完整 `account_number` 只能来自宿主信任边界（例如固定账户 adapter/Keychain 注入）或当次用户明确给出的账户。不得调 `get_accounts` 来猜默认账户，不得读取其他账户。完整账号不得进入决策 JSON、日志、Git 或报告。
+
+shadow 模式优先调用本地 `robinhood-account-readonly` 的零参数 `get_strategy_snapshot`。调用时不得传任何参数；必须同时核验 `binding.exact_id_bound=true`、`binding.suffix_verified=true`、所需 `coverage` 全部完成且返回内容只有脱敏账户引用。该快照的 `trade_readiness=false` 是设计边界：可以研究、核对与生成 shadow 决策，绝不能用它进入 review/place/cancel。若工具不存在、返回未知字段/状态、覆盖不完整或绑定不可验证，立即降级为 `research`，不得改用 `get_accounts`。
+
+只有 `supervised_review` 才使用下列 Robinhood 原生账户工具，并且仍须由宿主信任边界注入同一精确账户：
 
 每轮刷新：
 
