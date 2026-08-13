@@ -1,0 +1,44 @@
+{
+  "policy_version": "1.0-20260813-live",
+  "note": "唯一策略参数源，只有账户所有人能改。account_last4 改成你自己账户的末四位。mandate 只能在此基础上收紧。",
+  "account_last4": "0000",
+  "capital_cap": 5000.0,
+  "benchmarks": ["VTI", "QQQM"],
+  "max_data_age_seconds": 300,
+  "max_preview_age_seconds": 120,
+  "market_state_stock_caps": {"both_pass": 0.9, "one_pass": 0.6, "none_pass": 0.2},
+  "drawdown_tiers": [
+    {"threshold": 0.15, "stock_cap": 0.7},
+    {"threshold": 0.25, "stock_cap": 0.4},
+    {"threshold": 0.35, "stock_cap": 0.0}
+  ],
+  "halt_drawdown_threshold": 0.35,
+  "single_stock_max_weight": 0.15,
+  "stocks_total_max_weight": 0.30,
+  "max_stock_positions": 2,
+  "max_orders_per_day": 6,
+  "max_daily_turnover_ratio": 0.30,
+  "stock_entry": {
+    "min_price": 5.0,
+    "min_market_cap": 10000000000,
+    "min_avg_daily_volume": 1000000,
+    "min_days_to_earnings": 3
+  },
+  "valid_triggers": [
+    "weight_deviation",
+    "market_state_change",
+    "drawdown_action",
+    "thesis_break",
+    "qualified_candidate"
+  ],
+  "risk_exit_triggers": ["thesis_break", "drawdown_action"],
+  "allowed_asset_classes": ["stock", "etf", "cash_equiv"],
+  "etf_symbols": ["VTI", "QQQM"],
+  "cash_equiv_symbols": ["SGOV"],
+  "min_order_amount": 10.0,
+  "allowed_order_types": ["market_day", "limit_day"],
+  "mandate_file": "~/.codex-agentic-trader/mandate.json",
+  "halt_file": "~/.codex-agentic-trader/HALT",
+  "journal_file": "~/.codex-agentic-trader/journal.jsonl",
+  "keychain_service": "com.roy.codex-agentic-trader.mandate"
+}

@@ -1,0 +1,7 @@
+# 运行态与私有数据——永不入库
+journal.jsonl
+mandate.json
+HALT
+*.env
+.DS_Store
+__pycache__/
