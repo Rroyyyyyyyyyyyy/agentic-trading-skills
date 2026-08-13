@@ -289,6 +289,8 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("每天只做两次完整分析", skill)
         self.assertIn("performance_review.py", skill)
         self.assertIn("cadence_gate.py", skill)
+        self.assertIn("100 个日历日", skill)
+        self.assertIn("净利润 2,500 美元", skill)
 
 
 class RuntimeScopeTests(unittest.TestCase):

@@ -275,7 +275,7 @@ class JournalTests(unittest.TestCase):
 
     def test_masked_ref(self):
         row = journal_append.append(self.log, {"type": "decision",
-            "account_ref_masked": "****0000"})
+            "account_ref_masked": "****9690"})
         self.assertEqual(row["seq"], 0)
 
     def test_unknown_event_type(self):
@@ -341,25 +341,83 @@ class PerformanceReviewTests(unittest.TestCase):
                 "qqq_return": qqq, "same_interval": True,
                 "cash_flow_adjusted": True, "net_of_costs": True}
 
+    def challenge(self, **updates):
+        row = {
+            "started": True,
+            "as_of_date_et": "2026-08-13",
+            "start_date_et": "2026-08-07",
+            "strategy_external_capital": 5000.0,
+            "start_equity_adjusted": 5207.12,
+            "current_equity_adjusted": 5707.12,
+            "cash_flow_adjusted": True,
+            "net_of_costs": True,
+            "baseline_locked": True,
+            "start_rule_verified": True,
+        }
+        row.update(updates)
+        return row
+
+    def payload(self, periods=None, challenge=None):
+        return {"periods": periods or [self.period()],
+                "challenge": challenge or self.challenge()}
+
     def test_can_claim_only_after_twenty_days_and_beating_both(self):
-        result = performance_review.evaluate({"periods": [self.period()]}, POLICY)
+        result = performance_review.evaluate(self.payload(), POLICY)
         self.assertTrue(result["periods"][0]["can_claim_outperformance"])
         self.assertFalse(result["expand_qualified_stock_search"])
 
     def test_underperformance_expands_search_not_trade_authority(self):
-        result = performance_review.evaluate({"periods": [
-            self.period(days=5, strategy=0.01, voo=0.02, qqq=0.03)]}, POLICY)
+        result = performance_review.evaluate(self.payload(periods=[
+            self.period(days=5, strategy=0.01, voo=0.02, qqq=0.03)]), POLICY)
         self.assertTrue(result["expand_qualified_stock_search"])
         self.assertFalse(result["trade_authorized"])
 
     def test_short_history_cannot_claim(self):
-        result = performance_review.evaluate({"periods": [self.period(days=5)]}, POLICY)
+        result = performance_review.evaluate(
+            self.payload(periods=[self.period(days=5)]), POLICY)
         self.assertFalse(result["periods"][0]["can_claim_outperformance"])
 
     def test_requires_cash_flow_and_cost_alignment(self):
         row = self.period(); row["cash_flow_adjusted"] = False
         with self.assertRaises(ValueError):
-            performance_review.evaluate({"periods": [row]}, POLICY)
+            performance_review.evaluate(self.payload(periods=[row]), POLICY)
+
+    def test_100_calendar_day_profit_progress(self):
+        result = performance_review.evaluate(self.payload(), POLICY)["profit_challenge"]
+        self.assertEqual(result["challenge_day"], 7)
+        self.assertAlmostEqual(result["net_profit"], 500.0)
+        self.assertAlmostEqual(result["target_remaining"], 2000.0)
+        self.assertAlmostEqual(result["target_equity_adjusted"], 7707.12)
+        self.assertFalse(result["trade_authorized"])
+
+    def test_preparation_never_reports_percentage_progress(self):
+        challenge = {"started": False, "as_of_date_et": "2026-08-13",
+                     "strategy_external_capital": 4000.0}
+        result = performance_review.evaluate(
+            self.payload(challenge=challenge), POLICY)["profit_challenge"]
+        self.assertEqual(result["status"], "preparation")
+        self.assertIsNone(result["progress_ratio"])
+
+    def test_ready_day_waits_for_next_trading_day(self):
+        challenge = {"started": False, "as_of_date_et": "2026-08-13",
+                     "strategy_external_capital": 5000.0}
+        result = performance_review.evaluate(
+            self.payload(challenge=challenge), POLICY)["profit_challenge"]
+        self.assertEqual(result["status"], "ready_day")
+        self.assertIsNone(result["challenge_day"])
+
+    def test_challenge_requires_locked_adjusted_baseline(self):
+        challenge = self.challenge(baseline_locked=False)
+        with self.assertRaises(ValueError):
+            performance_review.evaluate(self.payload(challenge=challenge), POLICY)
+
+    def test_challenge_deadline_is_truthful(self):
+        challenge = self.challenge(as_of_date_et="2026-11-15",
+                                   current_equity_adjusted=7000.0)
+        result = performance_review.evaluate(
+            self.payload(challenge=challenge), POLICY)["profit_challenge"]
+        self.assertEqual(result["status"], "ended_below_target")
+        self.assertFalse(result["within_100_day_window"])
 
 
 if __name__ == "__main__":
