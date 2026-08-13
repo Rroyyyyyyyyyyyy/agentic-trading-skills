@@ -291,6 +291,8 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("cadence_gate.py", skill)
         self.assertIn("100 个日历日", skill)
         self.assertIn("净利润 2,500 美元", skill)
+        self.assertIn("每日目标", skill)
+        self.assertIn("controlled_offense", skill)
 
 
 class RuntimeScopeTests(unittest.TestCase):

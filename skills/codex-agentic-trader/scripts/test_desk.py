@@ -349,6 +349,7 @@ class PerformanceReviewTests(unittest.TestCase):
             "strategy_external_capital": 5000.0,
             "start_equity_adjusted": 5207.12,
             "current_equity_adjusted": 5707.12,
+            "peak_equity_adjusted": 5800.0,
             "cash_flow_adjusted": True,
             "net_of_costs": True,
             "baseline_locked": True,
@@ -359,7 +360,17 @@ class PerformanceReviewTests(unittest.TestCase):
 
     def payload(self, periods=None, challenge=None):
         return {"periods": periods or [self.period()],
-                "challenge": challenge or self.challenge()}
+                "challenge": challenge or self.challenge(),
+                "daily": {"date_et": "2026-08-13", "strategy_return": 0.01,
+                          "voo_return": 0.005, "qqq_return": 0.008,
+                          "same_session": True, "cash_flow_adjusted": True,
+                          "net_of_costs": True, "completed_session": True},
+                "risk_context": {"benchmark_a_pass": True,
+                                 "benchmark_b_pass": True,
+                                 "snapshot_complete": True,
+                                 "no_material_risk_event": True,
+                                 "halt_active": False,
+                                 "volatility_regime": "normal"}}
 
     def test_can_claim_only_after_twenty_days_and_beating_both(self):
         result = performance_review.evaluate(self.payload(), POLICY)
@@ -390,6 +401,15 @@ class PerformanceReviewTests(unittest.TestCase):
         self.assertAlmostEqual(result["target_equity_adjusted"], 7707.12)
         self.assertFalse(result["trade_authorized"])
 
+    def test_daily_objective_requires_beating_both(self):
+        result = performance_review.evaluate(self.payload(), POLICY)["daily_objective"]
+        self.assertTrue(result["objective_met"])
+        payload = self.payload()
+        payload["daily"]["strategy_return"] = 0.006
+        result = performance_review.evaluate(payload, POLICY)["daily_objective"]
+        self.assertFalse(result["objective_met"])
+        self.assertFalse(result["trade_authorized"])
+
     def test_preparation_never_reports_percentage_progress(self):
         challenge = {"started": False, "as_of_date_et": "2026-08-13",
                      "strategy_external_capital": 4000.0}
@@ -413,11 +433,57 @@ class PerformanceReviewTests(unittest.TestCase):
 
     def test_challenge_deadline_is_truthful(self):
         challenge = self.challenge(as_of_date_et="2026-11-15",
-                                   current_equity_adjusted=7000.0)
+                                   current_equity_adjusted=7000.0,
+                                   peak_equity_adjusted=7100.0)
         result = performance_review.evaluate(
             self.payload(challenge=challenge), POLICY)["profit_challenge"]
         self.assertEqual(result["status"], "ended_below_target")
         self.assertFalse(result["within_100_day_window"])
+
+    def test_far_behind_can_enter_controlled_offense(self):
+        challenge = self.challenge(as_of_date_et="2026-08-26",
+                                   current_equity_adjusted=5100.0,
+                                   peak_equity_adjusted=5300.0)
+        payload = self.payload(
+            periods=[self.period(days=10, strategy=-0.02, voo=0.02, qqq=0.03)],
+            challenge=challenge)
+        posture = performance_review.evaluate(payload, POLICY)["risk_posture"]
+        self.assertTrue(posture["controlled_offense_eligible"])
+        self.assertEqual(posture["posture"], "controlled_offense")
+        self.assertEqual(posture["target_allocation_if_candidates_qualify"]
+                         ["individual_stocks_total_max"], 0.30)
+        self.assertFalse(posture["trade_authorized"])
+
+    def test_controlled_offense_blocked_by_drawdown(self):
+        challenge = self.challenge(as_of_date_et="2026-08-26",
+                                   current_equity_adjusted=4500.0,
+                                   peak_equity_adjusted=5100.0)
+        payload = self.payload(
+            periods=[self.period(days=10, strategy=-0.10, voo=0.02, qqq=0.03)],
+            challenge=challenge)
+        posture = performance_review.evaluate(payload, POLICY)["risk_posture"]
+        self.assertFalse(posture["controlled_offense_eligible"])
+        self.assertFalse(posture["safeguards"]["drawdown_below_entry_limit"])
+
+    def test_controlled_offense_blocked_by_trend_or_high_volatility(self):
+        challenge = self.challenge(as_of_date_et="2026-08-26",
+                                   current_equity_adjusted=5100.0,
+                                   peak_equity_adjusted=5300.0)
+        payload = self.payload(
+            periods=[self.period(days=10, strategy=-0.02, voo=0.02, qqq=0.03)],
+            challenge=challenge)
+        payload["risk_context"]["benchmark_b_pass"] = False
+        payload["risk_context"]["volatility_regime"] = "high"
+        posture = performance_review.evaluate(payload, POLICY)["risk_posture"]
+        self.assertFalse(posture["controlled_offense_eligible"])
+        self.assertFalse(posture["safeguards"]["both_trends_pass"])
+        self.assertFalse(posture["safeguards"]["volatility_allowed"])
+
+    def test_controlled_offense_policy_cannot_exceed_hard_caps(self):
+        policy = copy.deepcopy(POLICY)
+        policy["controlled_offense"]["target_total_stock_weight"] = 0.31
+        with self.assertRaises(ValueError):
+            performance_review.evaluate(self.payload(), policy)
 
 
 if __name__ == "__main__":

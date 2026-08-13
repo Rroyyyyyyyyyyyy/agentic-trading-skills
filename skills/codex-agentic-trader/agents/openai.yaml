@@ -2,7 +2,7 @@ interface:
   display_name: "Codex Agentic Trader"
   short_description: "Robinhood 双分析、动态判断、双基准考核与自动交易"
   brand_color: "#00C805"
-  default_prompt: "Use $codex-agentic-trader for daily premarket and post-close analyses, dynamic 30-minute or 2-hour operation checks based on real buying power, the 100-calendar-day $2,500 net-profit goal, VOO/QQQ performance review, persistent daily lessons, and only clean policy-compliant Robinhood stock or ETF actions."
+  default_prompt: "Use $codex-agentic-trader for daily premarket and post-close analyses, buying-power-aware operation checks, the 100-day $2,500 net-profit goal, daily and rolling VOO/QQQ scoring, deterministic controlled offense only inside existing caps, persistent lessons, and clean policy-compliant Robinhood stock or ETF actions."
 
 dependencies:
   tools:
