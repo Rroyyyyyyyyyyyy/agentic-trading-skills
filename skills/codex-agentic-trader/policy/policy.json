@@ -39,6 +39,7 @@
   "allowed_order_types": ["market_day", "limit_day"],
   "mandate_file": "~/.codex-agentic-trader/mandate.json",
   "halt_file": "~/.codex-agentic-trader/HALT",
+  "gate_state_file": "~/.codex-agentic-trader/gate_state.json",
   "journal_file": "~/.codex-agentic-trader/journal.jsonl",
   "keychain_service": "com.roy.codex-agentic-trader.mandate"
 }

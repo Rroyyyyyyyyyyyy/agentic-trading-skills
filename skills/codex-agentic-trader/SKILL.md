@@ -5,7 +5,7 @@ description: Codex 专用的 Robinhood 实盘 agentic 交易 skill。在 Roy 签
 
 # Codex Agentic Trader（实盘版，mandate 授权制）
 
-本 skill 是 roy-trading-desk（Claude 手动执行版）的 Codex 姊妹版。区别只有一个：**在有效 mandate 内，执行者是 Codex 自己**。所有风控是确定性代码，LLM 不得覆盖。
+单一 skill 覆盖两种用法：**shadow 模式**（无 mandate 时的默认态）= 全流程研判 + 出决策卡，执行由人完成；**live 模式** = 有效 mandate 内 Codex 自主执行。所有风控是确定性代码，LLM 不得覆盖。研究方法见 [research-playbook.md](references/research-playbook.md)，基础决策契约见 [decision-card.md](references/decision-card.md)。
 
 ## 铁律（每次调用先读）
 

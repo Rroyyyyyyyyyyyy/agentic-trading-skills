@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """实盘两阶段确定性闸门（codex-agentic-trader）。
 
-在 roy-trading-desk 的 decision_gate 全量检查之上扩展：
-- mandate 授权推导模式（live/shadow），会话无权声明模式；
-- HALT 哨兵文件无条件停止下单；
-- 本地 intent 与券商订单对账，不平拒新单；
-- 两阶段：pre_preview（最多放行 can_preview）→ post_preview（校验 preview 回执后才 can_submit）；
-- 回撤触及最深档输出 halt_required=true；
-- mandate 上限与 policy 取更严。
+在 decision_gate 全量基础检查之上扩展：
+- mandate 授权推导模式（live/shadow），会话无权声明模式；到期日真实日历解析；
+- HALT 哨兵：存在时只放行风险退出卖单，其余全拒；halt_required 时闸门自写 HALT（自锁）；
+- 本地 intent 与券商订单对账（含重复 client_key 冲突检测），不平拒新单；
+- 两阶段：pre_preview → post_preview；preview 回执必须与提案逐字段绑定且一次性消费；
+- 闸门本地状态账本（gate_state_file）：当日已批订单数/金额/decision_key/preview_id 由闸门
+  自己记账，与调用方声明取更严——频次/换手/幂等不再单信调用方（对抗审查 P2 修复）；
+- limit_day 单必须携带限价；approved_intent 与 preview_id/decision_key/报价绑定锁单。
 
-本脚本只输出布尔判定与批准的 intent，自身没有任何券商调用能力。
-一切异常 fail-closed。
+本脚本只输出判定与批准的 intent，自身没有任何券商调用能力。一切异常 fail-closed。
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -23,8 +24,6 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 POLICY_PATH = SCRIPT_DIR.parent / "policy" / "policy.json"
-
-# 复用 roy-trading-desk 的基础检查实现，保持单一实现来源
 sys.path.insert(0, str(SCRIPT_DIR))
 
 VALID_ORDER_STATUSES = {"open", "partially_filled", "filled", "cancelled", "rejected", "unknown"}
@@ -54,8 +53,17 @@ def _expand(p):
     return Path(p).expanduser()
 
 
+def _parse_iso_date(s):
+    """严格 ISO 日期解析；任何非规范形式返回 None（P3 修复：不再用字符串比较）。"""
+    if not isinstance(s, str) or len(s) != 10:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
 def _keychain_checksum(service):
-    """读取 Keychain 中存储的 mandate sha256；不可用/不存在返回 None。"""
     try:
         out = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-w"],
@@ -69,8 +77,13 @@ def check_halt(policy):
     return _expand(policy["halt_file"]).exists()
 
 
+def write_halt(policy):
+    p = _expand(policy["halt_file"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.touch()
+
+
 def load_mandate(policy, today=None, skip_keychain=False):
-    """返回 (mandate dict | None, reason)。任何不满足 → (None, 原因)，调用方降级 shadow。"""
     path = _expand(policy["mandate_file"])
     if not path.exists():
         return None, "mandate_missing"
@@ -89,9 +102,9 @@ def load_mandate(policy, today=None, skip_keychain=False):
     expected = MANDATE_CONFIRMATION_TEMPLATE.format(last4=policy["account_last4"])
     if m.get("confirmation") != expected:
         return None, "mandate_confirmation_invalid"
-    today = today or date.today().isoformat()
-    exp = m.get("expires_at_et")
-    if not (isinstance(exp, str) and len(exp) == 10 and exp >= today):
+    today_d = _parse_iso_date(today or date.today().isoformat())
+    exp_d = _parse_iso_date(m.get("expires_at_et"))
+    if today_d is None or exp_d is None or exp_d < today_d:
         return None, "mandate_expired"
     for f in ("max_order_amount", "max_daily_turnover"):
         if not _is_finite_number(m.get(f)) or m[f] <= 0:
@@ -103,6 +116,54 @@ def load_mandate(policy, today=None, skip_keychain=False):
             return None, "mandate_checksum_mismatch"
     return m, "ok"
 
+
+# ---------- 闸门本地状态账本（P2 修复） ----------
+
+def empty_state(date_et):
+    return {"date_et": date_et, "orders": []}
+
+
+def load_state(path, date_et):
+    """读取状态账本；换日或不可读则重置为空（保守方向：空账本只会让检查更依赖调用方，
+    因此不可读时保留 fail-closed 标记由调用处理）。"""
+    p = _expand(path)
+    if not p.exists():
+        return empty_state(date_et), "ok"
+    try:
+        s = json.loads(p.read_text())
+        if not (isinstance(s, dict) and isinstance(s.get("orders"), list)):
+            return None, "state_corrupt"
+        if s.get("date_et") != date_et:
+            return empty_state(date_et), "ok"
+        for o in s["orders"]:
+            if not (isinstance(o, dict) and isinstance(o.get("decision_key"), str)
+                    and _is_finite_number(o.get("amount"))):
+                return None, "state_corrupt"
+        return s, "ok"
+    except Exception:  # noqa: BLE001
+        return None, "state_corrupt"
+
+
+def save_state(path, state):
+    p = _expand(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps(state, ensure_ascii=False))
+        fh.flush()
+        import os
+        os.fsync(fh.fileno())
+
+
+def record_submission(state, decision_key, preview_id, amount):
+    state["orders"].append({"decision_key": decision_key,
+                            "preview_id": preview_id, "amount": amount})
+    return state
+
+
+# ---------- 检查块 ----------
 
 def check_reconciliation(recon, violations):
     if not isinstance(recon, dict):
@@ -122,7 +183,14 @@ def check_reconciliation(recon, violations):
     if not (_valid(intents) and _valid(broker)):
         violations.append("invalid_reconciliation_entry")
         return
-    broker_by_key = {r["client_key"]: r for r in broker}
+    broker_by_key = {}
+    for r in broker:
+        k = r["client_key"]
+        if k in broker_by_key and broker_by_key[k]["status"] != r["status"]:
+            # P7 修复：同 client_key 冲突状态 = 券商侧不一致
+            violations.append("reconciliation_mismatch")
+            return
+        broker_by_key[k] = r
     local_keys = {r["client_key"] for r in intents}
     for it in intents:
         if it["status"] == "unknown":
@@ -137,7 +205,8 @@ def check_reconciliation(recon, violations):
             return
 
 
-def check_preview(preview, policy, violations):
+def check_preview(preview, policy, prop, used_preview_ids, violations):
+    """P1 修复：回执必须与提案逐字段绑定，且 preview_id 一次性消费。"""
     if not isinstance(preview, dict):
         violations.append("missing_preview")
         return
@@ -145,18 +214,28 @@ def check_preview(preview, policy, violations):
         violations.append("preview_not_clean")
     if preview.get("warnings") != []:
         violations.append("preview_has_warnings")
-    if not (isinstance(preview.get("preview_id"), str) and preview["preview_id"]):
+    pid = preview.get("preview_id")
+    if not (isinstance(pid, str) and pid):
         violations.append("preview_id_missing")
+    elif pid in used_preview_ids:
+        violations.append("preview_replayed")
     age = preview.get("preview_age_seconds")
     if not (_is_finite_number(age) and 0 <= age <= policy["max_preview_age_seconds"]):
         violations.append("preview_stale")
     qp = preview.get("quoted_price")
     if not (_is_finite_number(qp) and qp > 0):
         violations.append("preview_quoted_price_invalid")
+    # 与提案绑定：symbol/side/amount 必须逐字段一致
+    if preview.get("symbol") != prop.get("symbol") or preview.get("side") != prop.get("side"):
+        violations.append("preview_proposal_mismatch")
+    amt = preview.get("amount")
+    if not (_is_finite_number(amt) and _is_finite_number(prop.get("amount"))
+            and abs(amt - prop["amount"]) <= 0.01):
+        violations.append("preview_proposal_mismatch")
 
 
-def evaluate(payload, policy, today=None, skip_keychain=False):
-    import decision_gate  # 基础检查的单一实现来源（roy-trading-desk）
+def evaluate(payload, policy, today=None, skip_keychain=False, state=None):
+    import decision_gate
 
     phase = payload.get("phase")
     if phase not in ("pre_preview", "post_preview"):
@@ -168,40 +247,77 @@ def evaluate(payload, policy, today=None, skip_keychain=False):
                 "can_preview": False, "can_submit": False, "halt_required": False,
                 "violations": ["mode_must_not_be_declared"]}
 
-    # 模式推导：mandate + HALT
     halted = check_halt(policy)
     mandate, mandate_reason = load_mandate(policy, today=today, skip_keychain=skip_keychain)
-    mode = "live" if (mandate and not halted) else "shadow"
+    mode = "live" if mandate else "shadow"
 
-    # 基础检查复用 decision_gate（其契约要求 mode=decide）
-    base_payload = dict(payload)
-    base_payload["mode"] = "decide"
-    base_payload.pop("phase", None)
-    base_payload.pop("reconciliation", None)
-    base_payload.pop("preview", None)
-    base = decision_gate.evaluate(base_payload, policy)
-    violations = list(base["violations"])
-
-    # mandate 上限收紧（live 才有 mandate；shadow 也照 policy 检查）
-    prop = payload.get("proposal") or {}
-    amount = prop.get("amount")
+    prop = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else {}
     is_risk_exit = (prop.get("side") == "sell"
                     and prop.get("trigger") in policy["risk_exit_triggers"])
+
+    # 状态账本合并：频次/换手/幂等取「调用方声明 ∪ 闸门自身记录」的更严值（P2 修复）
+    violations = []
+    state_orders = (state or {}).get("orders", []) if state is not None else []
+    hist = payload.get("history") if isinstance(payload.get("history"), dict) else {}
+    merged_hist = dict(hist)
+    caller_orders = hist.get("orders_today")
+    caller_turnover = hist.get("turnover_today")
+    if _is_finite_number(caller_orders):
+        merged_hist["orders_today"] = max(caller_orders, len(state_orders))
+    if _is_finite_number(caller_turnover):
+        merged_hist["turnover_today"] = max(
+            caller_turnover, sum(o["amount"] for o in state_orders))
+    state_keys = [o["decision_key"] for o in state_orders]
+    caller_keys = hist.get("used_decision_keys")
+    merged_hist["used_decision_keys"] = (
+        (caller_keys if isinstance(caller_keys, list) else []) + state_keys)
+    used_preview_ids = set(
+        o.get("preview_id") for o in state_orders if o.get("preview_id"))
+    caller_pids = hist.get("used_preview_ids")
+    if isinstance(caller_pids, list):
+        used_preview_ids.update(p for p in caller_pids if isinstance(p, str))
+
+    # 基础检查复用 decision_gate
+    base_payload = dict(payload)
+    base_payload["mode"] = "decide"
+    base_payload["history"] = merged_hist
+    base_payload.pop("phase", None)
+    recon_sub = base_payload.pop("reconciliation", None)
+    preview_sub = base_payload.pop("preview", None)
+    base = decision_gate.evaluate(base_payload, policy)
+    violations += list(base["violations"])
+
+    # P6 修复：被 pop 的子树也要过账号泄漏扫描
+    decision_gate._scan_account_like({"reconciliation": recon_sub, "preview": preview_sub},
+                                     violations)
+
+    # limit_day 必须带限价，market_day 不得带（P4 修复）
+    limit_price = prop.get("limit_price")
+    if prop.get("order_type") == "limit_day":
+        if not (_is_finite_number(limit_price) and limit_price > 0):
+            violations.append("limit_price_required")
+    elif limit_price is not None:
+        violations.append("limit_price_forbidden_for_market_order")
+
+    # mandate 额度（风险退出卖单豁免）
+    amount = prop.get("amount")
     if mandate and _is_finite_number(amount) and not is_risk_exit:
-        # 风险退出卖单豁免 mandate 额度：降风险动作不受授权额度阻拦（仍记账、仍走两阶段）
         if amount > mandate["max_order_amount"] + 1e-9:
             violations.append("mandate_order_amount_exceeded")
-        hist = payload.get("history") or {}
-        turnover = hist.get("turnover_today")
+        turnover = merged_hist.get("turnover_today")
         if _is_finite_number(turnover) and turnover + amount > mandate["max_daily_turnover"] + 1e-9:
             violations.append("mandate_daily_turnover_exceeded")
 
-    # 对账（两个 phase 都要）
-    check_reconciliation(payload.get("reconciliation"), violations)
+    # 对账
+    check_reconciliation(recon_sub, violations)
 
-    # post_preview 校验
+    # HALT：存在时只放行风险退出卖单（hard-boundaries §4 清仓通道）
+    if halted and not is_risk_exit:
+        violations.append("halt_active")
+
+    # post_preview 校验（含提案绑定与重放检测）
     if phase == "post_preview":
-        check_preview(payload.get("preview"), policy, violations)
+        check_preview(preview_sub, policy, prop, used_preview_ids, violations)
 
     # 回撤断路器
     halt_required = False
@@ -210,9 +326,7 @@ def evaluate(payload, policy, today=None, skip_keychain=False):
     if isinstance(dd, (int, float)) and dd >= policy["halt_drawdown_threshold"]:
         halt_required = True
 
-    if halted:
-        violations.append("halt_active")
-
+    violations = list(dict.fromkeys(violations))
     would_allow = not violations
     result = {
         "mode": mode,
@@ -239,21 +353,27 @@ def evaluate(payload, policy, today=None, skip_keychain=False):
             "symbol": prop.get("symbol"),
             "side": prop.get("side"),
             "amount": amount,
+            "asset_class": prop.get("asset_class"),
             "order_type": prop.get("order_type"),
+            "limit_price": limit_price,
+            "trigger": prop.get("trigger"),
+            "decision_key": base.get("decision_key"),
+            "preview_id": (preview_sub or {}).get("preview_id"),
+            "quoted_price": (preview_sub or {}).get("quoted_price"),
             "client_key_required": True,
         }
     return result
 
 
 def check_runtime(policy):
-    """--check-runtime：安装态自检（mandate/HALT/policy 完整性），供每次运行开头调用。"""
     halted = check_halt(policy)
     mandate, reason = load_mandate(policy)
     report = {
         "halt_active": halted,
         "mandate_status": reason,
-        "mode_if_run_now": "live" if (mandate and not halted) else "shadow",
+        "mode_if_run_now": "live" if mandate else "shadow",
         "policy_version": policy.get("policy_version"),
+        "note": "HALT 存在时仅允许风险退出卖单" if halted else None,
     }
     if mandate:
         report["mandate_expires_at_et"] = mandate["expires_at_et"]
@@ -285,10 +405,37 @@ def main():
         payload = json.loads(raw, object_pairs_hook=_reject_dup_keys)
     except Exception as exc:  # noqa: BLE001
         _fail([f"input_error:{type(exc).__name__}"])
+
+    date_et = str(payload.get("as_of_et", ""))[:10]
+    state, state_status = load_state(policy["gate_state_file"], date_et)
+    if state_status != "ok":
+        _fail(["gate_state_corrupt"], phase=str(payload.get("phase")))
     try:
-        result = evaluate(payload, policy)
+        result = evaluate(payload, policy, state=state)
     except Exception as exc:  # noqa: BLE001
         _fail([f"gate_internal_error:{type(exc).__name__}"], phase=str(payload.get("phase")))
+
+    # P5 修复：断路器自锁——halt_required 时闸门自己写 HALT（幂等），不依赖 runner 履约
+    if result.get("halt_required"):
+        try:
+            write_halt(policy)
+        except Exception:  # noqa: BLE001
+            result["violations"].append("halt_write_failed")
+            result["would_allow"] = False
+            result["can_preview"] = False
+            result["can_submit"] = False
+    # 批准提交即入本地账本（幂等/频次的闸门侧真相）
+    if result.get("can_submit"):
+        try:
+            record_submission(state, result["decision_key"],
+                              result["approved_intent"].get("preview_id"),
+                              result["approved_intent"].get("amount"))
+            save_state(policy["gate_state_file"], state)
+        except Exception:  # noqa: BLE001
+            result["can_submit"] = False
+            result["would_allow"] = False
+            result["violations"].append("gate_state_write_failed")
+
     print(json.dumps(result, ensure_ascii=False))
     sys.exit(0 if result["would_allow"] else 1)
 

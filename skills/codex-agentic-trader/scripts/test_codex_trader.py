@@ -84,9 +84,10 @@ def base_payload(phase="pre_preview"):
     }
 
 
-def good_preview():
+def good_preview(symbol="ABCD", side="buy", amount=500.0):
     return {"preview_id": "pv-1", "preflight_status": "clean", "warnings": [],
-            "quoted_price": 25.05, "preview_age_seconds": 30}
+            "quoted_price": 25.05, "preview_age_seconds": 30,
+            "symbol": symbol, "side": side, "amount": amount}
 
 
 class ModeDerivationTests(unittest.TestCase):
@@ -145,14 +146,25 @@ class ModeDerivationTests(unittest.TestCase):
 
 
 class HaltTests(unittest.TestCase):
-    def test_halt_blocks_live(self):
+    def test_halt_blocks_buy(self):
         d, policy = make_env(); self.addCleanup(d.cleanup)
         write_mandate(policy)
         Path(policy["halt_file"]).touch()
         r = live_gate.evaluate(base_payload(), policy, today=TODAY, skip_keychain=True)
-        self.assertEqual(r["mode"], "shadow")
         self.assertIn("halt_active", r["violations"])
         self.assertFalse(r.get("can_preview"))
+
+    def test_halt_allows_risk_exit_sell(self):
+        # hard-boundaries §4：HALT 期间清仓走风险退出通道
+        d, policy = make_env(); self.addCleanup(d.cleanup)
+        write_mandate(policy)
+        Path(policy["halt_file"]).touch()
+        p = base_payload()
+        p["account"]["positions"].append({"symbol": "ABCD", "value": 600.0, "asset_class": "stock"})
+        p["proposal"].update({"side": "sell", "trigger": "drawdown_action"})
+        p["proposal"]["declares"] = {"is_leveraged_or_inverse": False, "is_otc": False}
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertTrue(r["can_preview"], r["violations"])
 
     def test_deep_drawdown_sets_halt_required(self):
         d, policy = make_env(); self.addCleanup(d.cleanup)
@@ -309,6 +321,137 @@ class TwoPhaseTests(unittest.TestCase):
         r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
         self.assertEqual(r["mode"], "shadow")
         self.assertFalse(r["can_submit"]); self.assertFalse(r["can_preview"])
+
+
+class AdversarialFixTests(unittest.TestCase):
+    """对抗审查 P1-P7 修复的回归。"""
+
+    def _live_env(self):
+        d, policy = make_env(); self.addCleanup(d.cleanup)
+        write_mandate(policy)
+        return policy
+
+    # P1: preview 与提案绑定 + 重放
+    def test_preview_symbol_mismatch_rejected(self):
+        policy = self._live_env()
+        p = base_payload("post_preview")
+        p["preview"] = good_preview(symbol="VTI")
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertIn("preview_proposal_mismatch", r["violations"])
+
+    def test_preview_amount_mismatch_rejected(self):
+        policy = self._live_env()
+        p = base_payload("post_preview")
+        p["preview"] = good_preview(amount=400.0)
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertIn("preview_proposal_mismatch", r["violations"])
+
+    def test_preview_replay_rejected_via_history(self):
+        policy = self._live_env()
+        p = base_payload("post_preview")
+        p["preview"] = good_preview()
+        p["history"]["used_preview_ids"] = ["pv-1"]
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertIn("preview_replayed", r["violations"])
+
+    # P2: 闸门状态账本比调用方声明更严
+    def test_state_ledger_enforces_order_limit(self):
+        policy = self._live_env()
+        state = {"date_et": TODAY, "orders": [
+            {"decision_key": f"k{i}", "preview_id": f"p{i}", "amount": 50.0}
+            for i in range(6)]}
+        p = base_payload()  # 调用方谎报 orders_today=1
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True, state=state)
+        self.assertIn("daily_order_limit_reached", r["violations"])
+
+    def test_state_ledger_enforces_turnover(self):
+        policy = self._live_env()
+        state = {"date_et": TODAY, "orders": [
+            {"decision_key": "k1", "preview_id": "p1", "amount": 1400.0}]}
+        p = base_payload()  # 调用方谎报 turnover_today=300；账本 1400+500 > 1500
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True, state=state)
+        self.assertIn("daily_turnover_over_cap", r["violations"])
+
+    def test_state_ledger_enforces_idempotency(self):
+        policy = self._live_env()
+        import decision_gate
+        key = decision_gate.compute_decision_key(TODAY, "ABCD", "buy",
+                                                 "qualified_candidate", 500.0)
+        state = {"date_et": TODAY, "orders": [
+            {"decision_key": key, "preview_id": "px", "amount": 500.0}]}
+        r = live_gate.evaluate(base_payload(), policy, today=TODAY,
+                               skip_keychain=True, state=state)
+        self.assertIn("duplicate_decision", [v for v in r["violations"]])
+
+    def test_state_ledger_blocks_preview_replay(self):
+        policy = self._live_env()
+        state = {"date_et": TODAY, "orders": [
+            {"decision_key": "kold", "preview_id": "pv-1", "amount": 100.0}]}
+        p = base_payload("post_preview"); p["preview"] = good_preview()
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True, state=state)
+        self.assertIn("preview_replayed", r["violations"])
+
+    # P3: 到期日真实解析
+    def test_malformed_expiry_dates_all_shadow(self):
+        for bad in ("2026-13-45", "9999-99-99", "2026-08-9 ", "2026-8-13 "):
+            d, policy = make_env(); self.addCleanup(d.cleanup)
+            write_mandate(policy, expires=bad)
+            r = live_gate.evaluate(base_payload(), policy, today=TODAY, skip_keychain=True)
+            self.assertEqual(r["mode"], "shadow", bad)
+            self.assertEqual(r["mandate_status"], "mandate_expired", bad)
+
+    def test_expiry_today_still_valid(self):
+        d, policy = make_env(); self.addCleanup(d.cleanup)
+        write_mandate(policy, expires=TODAY)
+        r = live_gate.evaluate(base_payload(), policy, today=TODAY, skip_keychain=True)
+        self.assertEqual(r["mode"], "live")
+
+    # P4: limit_day 限价
+    def test_limit_day_requires_limit_price(self):
+        policy = self._live_env()
+        p = base_payload(); p["proposal"]["order_type"] = "limit_day"
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertIn("limit_price_required", r["violations"])
+
+    def test_market_day_rejects_limit_price(self):
+        policy = self._live_env()
+        p = base_payload(); p["proposal"]["limit_price"] = 25.0
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertIn("limit_price_forbidden_for_market_order", r["violations"])
+
+    def test_approved_intent_locks_order(self):
+        policy = self._live_env()
+        p = base_payload("post_preview")
+        p["proposal"]["order_type"] = "limit_day"
+        p["proposal"]["limit_price"] = 24.9
+        p["preview"] = good_preview()
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertTrue(r["can_submit"], r["violations"])
+        ai = r["approved_intent"]
+        self.assertEqual(ai["limit_price"], 24.9)
+        self.assertEqual(ai["preview_id"], "pv-1")
+        self.assertEqual(ai["decision_key"], r["decision_key"])
+        self.assertEqual(ai["asset_class"], "stock")
+
+    # P6: preview/reconciliation 子树的账号扫描
+    def test_account_digits_in_preview_scanned(self):
+        policy = self._live_env()
+        p = base_payload("post_preview")
+        p["preview"] = good_preview()
+        p["preview"]["memo"] = "acct 1234567890123456"
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertIn("account_like_identifier_present", r["violations"])
+
+    # P7: broker 同 client_key 冲突状态
+    def test_broker_conflicting_duplicate_client_key(self):
+        policy = self._live_env()
+        p = base_payload()
+        p["reconciliation"] = {
+            "local_intents": [{"client_key": "k1", "status": "open"}],
+            "broker_orders": [{"client_key": "k1", "status": "open"},
+                               {"client_key": "k1", "status": "filled"}]}
+        r = live_gate.evaluate(p, policy, today=TODAY, skip_keychain=True)
+        self.assertIn("reconciliation_mismatch", r["violations"])
 
 
 class BaseChecksStillApplyTests(unittest.TestCase):
