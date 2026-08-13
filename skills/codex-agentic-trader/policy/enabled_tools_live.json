@@ -1,5 +1,5 @@
 {
-  "_note": "2026-08-13 按 Robinhood 当前官方 MCP 契约核对。这是 supervised_review 工具面，不是无人值守自治授权。多一少一均 fail-closed；契约漂移需人工复审 policy 与测试。",
+  "_note": "2026-08-13 按 Robinhood 当前官方 MCP 契约核对。单一自动流程仅允许这些市场、账户只读和股票/ETF 订单工具；契约漂移一律 fail-closed。",
   "expected_tools": [
     "search",
     "get_equity_quotes",
@@ -13,9 +13,12 @@
     "get_indexes",
     "get_index_quotes",
     "get_index_historicals",
+    "get_accounts",
     "get_portfolio",
     "get_equity_positions",
     "get_equity_orders",
+    "get_option_positions",
+    "get_option_orders",
     "get_equity_tradability",
     "get_equity_tax_lots",
     "get_pnl_trade_history",

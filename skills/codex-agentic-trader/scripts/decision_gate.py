@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""确定性决策闸门（shadow/manual-execution only）。
+"""确定性决策闸门。
 
 读取决策 JSON（契约见 references/decision-card.md），按固定顺序执行全部检查，
 输出 would_allow 与 manual_card。本脚本没有、也永远不得有任何券商写能力；

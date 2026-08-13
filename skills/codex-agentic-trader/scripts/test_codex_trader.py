@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""Mandate, reconciliation and Robinhood review-contract tests. No broker access."""
-import hashlib
+"""Reconciliation, risk and Robinhood review-contract tests. No broker access."""
 import json
-import os
 import tempfile
 import unittest
 import uuid
@@ -22,33 +20,9 @@ NOW = datetime(2026, 8, 13, 15, 42, tzinfo=ET)
 def make_env():
     tmp = tempfile.TemporaryDirectory()
     policy = json.loads(json.dumps(live_gate.load_policy()))
-    policy["mandate_file"] = str(Path(tmp.name) / "mandate.json")
     policy["halt_file"] = str(Path(tmp.name) / "HALT")
     policy["gate_state_file"] = str(Path(tmp.name) / "gate-state.json")
     return tmp, policy
-
-
-def write_mandate(policy, *, start=NOW - timedelta(hours=1), days=7,
-                  max_order=600.0, max_turnover=1500.0, max_orders=3,
-                  last4=None, policy_hash=None, toolset_hash=None, perms=0o600):
-    toolset = json.loads(live_gate.TOOLSET_PATH.read_text())
-    account_last4 = last4 or policy["account_last4"]
-    mandate = {
-        "mandate_version": "2.0", "mandate_id": str(uuid.uuid4()),
-        "account_ref_masked": f"****{account_last4}", "execution_mode": "supervised_review",
-        "requires_per_order_confirmation": True,
-        "issued_at_et": start.isoformat(), "not_before_et": start.isoformat(),
-        "expires_at_et": (start + timedelta(days=days)).isoformat(),
-        "max_order_amount": max_order, "max_daily_turnover": max_turnover,
-        "max_orders_per_day": max_orders,
-        "policy_sha256": policy_hash or live_gate._canonical_hash(policy),
-        "toolset_sha256": toolset_hash or live_gate._canonical_hash(toolset),
-        "confirmation": live_gate.MANDATE_CONFIRMATION_TEMPLATE.format(last4=account_last4),
-    }
-    path = Path(policy["mandate_file"])
-    path.write_text(json.dumps(mandate)); os.chmod(path, perms)
-    return mandate
-
 
 def payload(phase="pre_review"):
     row = base_payload()
@@ -80,75 +54,30 @@ def review(symbol="ABCD", side="buy", amount="500.00", observed=None):
 
 
 def evaluate(row, policy, state=None, now=NOW):
-    return live_gate.evaluate(row, policy, now=now, skip_keychain=True,
+    return live_gate.evaluate(row, policy, now=now,
                               state=state or {"date_et": "2026-08-13", "orders": []})
 
 
-class MandateTests(unittest.TestCase):
+class SingleFlowTests(unittest.TestCase):
     def setUp(self):
         self.tmp, self.policy = make_env()
         self.addCleanup(self.tmp.cleanup)
 
-    def test_missing_is_shadow(self):
+    def test_pre_review_can_review(self):
         result = evaluate(payload(), self.policy)
-        self.assertEqual(result["mode"], "shadow")
-        self.assertTrue(result["shadow_would_allow"], result["violations"])
-        self.assertFalse(result["can_review"])
-
-    def test_valid_is_supervised(self):
-        write_mandate(self.policy)
-        result = evaluate(payload(), self.policy)
-        self.assertEqual(result["mode"], "supervised")
         self.assertTrue(result["can_review"], result["violations"])
         self.assertFalse(result["can_submit"])
 
-    def test_wrong_account(self):
-        write_mandate(self.policy, last4="9999")
-        result = evaluate(payload(), self.policy)
-        self.assertEqual(result["mandate_status"], "mandate_account_mismatch")
-
-    def test_expired(self):
-        write_mandate(self.policy, start=NOW - timedelta(days=8), days=7)
-        self.assertEqual(evaluate(payload(), self.policy)["mandate_status"],
-                         "mandate_expired")
-
-    def test_policy_drift(self):
-        write_mandate(self.policy, policy_hash="0" * 64)
-        self.assertEqual(evaluate(payload(), self.policy)["mandate_status"],
-                         "mandate_policy_drift")
-
-    def test_toolset_drift(self):
-        write_mandate(self.policy, toolset_hash="0" * 64)
-        self.assertEqual(evaluate(payload(), self.policy)["mandate_status"],
-                         "mandate_toolset_drift")
-
-    def test_open_permissions(self):
-        write_mandate(self.policy, perms=0o644)
-        self.assertEqual(evaluate(payload(), self.policy)["mandate_status"],
-                         "mandate_permissions_too_open")
-
-    def test_mandate_order_cap(self):
-        write_mandate(self.policy, max_order=400)
-        self.assertIn("mandate_order_amount_exceeded",
-                      evaluate(payload(), self.policy)["violations"])
-
-    def test_mandate_count_cap(self):
-        write_mandate(self.policy, max_orders=1)
-        self.assertIn("mandate_daily_order_limit_reached",
-                      evaluate(payload(), self.policy)["violations"])
-
-    def test_mandate_never_grants_submit(self):
-        write_mandate(self.policy)
+    def test_clean_post_review_can_submit(self):
         row = payload("post_review"); row["review"] = review()
         result = evaluate(row, self.policy)
-        self.assertTrue(result["can_request_confirmation"], result["violations"])
-        self.assertFalse(result["can_submit"])
+        self.assertTrue(result["can_submit"], result["violations"])
+        self.assertFalse(result["approved_intent"]["requires_explicit_confirmation"])
 
 
 class RuntimeSafetyTests(unittest.TestCase):
     def setUp(self):
         self.tmp, self.policy = make_env(); self.addCleanup(self.tmp.cleanup)
-        write_mandate(self.policy)
 
     def test_halt_blocks_buy(self):
         Path(self.policy["halt_file"]).touch()
@@ -168,9 +97,9 @@ class RuntimeSafetyTests(unittest.TestCase):
         row = payload(); row["account"].pop("coverage")
         self.assertIn("snapshot_coverage_missing", evaluate(row, self.policy)["violations"])
 
-    def test_advanced_orders_unverified(self):
-        row = payload(); row["account"]["coverage"]["advanced_orders_checked"] = False
-        self.assertIn("advanced_order_coverage_unverified",
+    def test_advanced_orders_boolean_required(self):
+        row = payload(); row["account"]["coverage"]["advanced_orders_checked"] = None
+        self.assertIn("advanced_order_coverage_invalid",
                       evaluate(row, self.policy)["violations"])
 
     def test_weekend(self):
@@ -197,7 +126,6 @@ class RuntimeSafetyTests(unittest.TestCase):
 class ReconciliationTests(unittest.TestCase):
     def setUp(self):
         self.tmp, self.policy = make_env(); self.addCleanup(self.tmp.cleanup)
-        write_mandate(self.policy)
 
     def test_matched_active(self):
         row = payload(); row["reconciliation"] = {
@@ -235,16 +163,15 @@ class ReconciliationTests(unittest.TestCase):
 class ReviewTests(unittest.TestCase):
     def setUp(self):
         self.tmp, self.policy = make_env(); self.addCleanup(self.tmp.cleanup)
-        write_mandate(self.policy)
 
     def run_review(self, value, state=None):
         row = payload("post_review"); row["review"] = value
         return evaluate(row, self.policy, state=state)
 
-    def test_clean_requests_confirmation(self):
+    def test_clean_can_submit(self):
         result = self.run_review(review())
-        self.assertTrue(result["can_request_confirmation"], result["violations"])
-        self.assertTrue(result["approved_intent"]["requires_explicit_confirmation"])
+        self.assertTrue(result["can_submit"], result["violations"])
+        self.assertFalse(result["approved_intent"]["requires_explicit_confirmation"])
         uuid.UUID(result["approved_intent"]["ref_id"])
 
     def test_missing(self):
@@ -291,19 +218,18 @@ class ReviewTests(unittest.TestCase):
         value["request"].update(type="limit", quantity="20", limit_price="25")
         value["response"].update(type="limit", quantity="20", limit_price="25")
         row["review"] = value
-        self.assertTrue(evaluate(row, self.policy)["can_request_confirmation"])
+        self.assertTrue(evaluate(row, self.policy)["can_submit"])
 
 
 class GateStateTests(unittest.TestCase):
     def setUp(self):
         self.tmp, self.policy = make_env(); self.addCleanup(self.tmp.cleanup)
-        write_mandate(self.policy, max_orders=3)
 
     def test_state_is_stricter_than_caller(self):
         state = {"date_et": "2026-08-13", "orders": [
             {"decision_key": f"k{i}", "review_fingerprint": f"r{i}",
-             "ref_id": str(uuid.uuid4()), "amount": 50.0} for i in range(3)]}
-        self.assertIn("mandate_daily_order_limit_reached",
+             "ref_id": str(uuid.uuid4()), "amount": 50.0} for i in range(6)]}
+        self.assertIn("daily_order_limit_reached",
                       evaluate(payload(), self.policy, state=state)["violations"])
 
     def test_state_file_permissions(self):
@@ -353,13 +279,13 @@ class OrderLedgerTests(unittest.TestCase):
 
 
 class SkillContractTests(unittest.TestCase):
-    def test_shadow_uses_zero_argument_account_bound_snapshot(self):
+    def test_single_flow_uses_exact_account_and_trade_gates(self):
         skill = (Path(__file__).parents[1] / "SKILL.md").read_text()
-        self.assertIn("robinhood-account-readonly", skill)
-        self.assertIn("get_strategy_snapshot", skill)
-        self.assertIn("不得传任何参数", skill)
-        self.assertIn("trade_readiness=false", skill)
-        self.assertIn("不得改用 `get_accounts`", skill)
+        self.assertIn("每轮最多调用一次 `get_accounts`", skill)
+        self.assertIn("review_equity_order", skill)
+        self.assertIn("place_equity_order", skill)
+        self.assertIn("can_submit=true", skill)
+        self.assertIn("用户不需要管理能力层、凭证或模式切换", skill)
 
 
 class RuntimeScopeTests(unittest.TestCase):
@@ -374,12 +300,12 @@ class RuntimeScopeTests(unittest.TestCase):
         expected = set(json.loads(live_gate.TOOLSET_PATH.read_text())["expected_tools"])
         result = runtime_scope_gate_live.evaluate_scope(self.config(), expected)
         self.assertTrue(result["scope_pass"])
-        self.assertFalse(result["autonomous_execution_authorized"])
+        self.assertTrue(result["trading_tools_ready"])
 
     def test_extra_tool(self):
         expected = set(json.loads(live_gate.TOOLSET_PATH.read_text())["expected_tools"])
         result = runtime_scope_gate_live.evaluate_scope(
-            self.config(sorted(expected | {"get_accounts"})), expected)
+            self.config(sorted(expected | {"transfer_funds"})), expected)
         self.assertFalse(result["scope_pass"])
 
     def test_duplicate_tool(self):

@@ -1,46 +1,38 @@
 # Codex Agentic Trader
 
-一个面向 Robinhood 股票/ETF 的单一 Codex Skill：市场研究、现金账户快照、确定性风控、Robinhood 订单审核、逐笔确认、订单终态对账和复盘。
+一个面向 Robinhood 美国上市普通股和普通 ETF 的单一 Codex Skill。它将实时市场研究、金融新闻、账户/订单后台核对、确定性风控、Robinhood 订单审核、合规提交、终态对账和复盘放在一条固定流程中。
 
-> 当前发布版是 `shadow` + `supervised_review`，不是无人值守自主实盘。Mandate 是有限委托，不是身份认证，也不能绕过 Robinhood 的审核与确认。
+> 用户不需要管理多套能力层或额外凭证。但每次券商操作前的账户、购买力、挂单、成交和审核回执核对仍是内部必做步骤。
 
-⚠️ 本项目为个人研究与自动化基础设施，不构成投资建议，也不能保证收益或限制最大损失。
-
-## 为什么重新设计 mandate
-
-旧设计把 mandate 说成“唯一实盘授权”和“Agent 无法自行签发”，这个安全结论并不成立：同一用户权限下的 Agent 可以创建 PTY、修改文件，甚至直接调用已暴露的券商工具。
-
-v2 将 mandate 降回它真正擅长的角色：
-
-- 给委托一个 `mandate_id`、起止时间和执行模式；
-- 将单笔金额、每日换手和订单数限制在 policy 以下；
-- 绑定 policy 与 Robinhood 工具清单的哈希，配置变化即失效；
-- 为审核日志提供可追溯的委托上下文；
-- 可单独撤销，使流程立即回到 shadow。
-
-它是 necessary but not sufficient。真实执行仍需要 Robinhood 的 Agentic 账户权限、精确账户绑定、严格工具白名单、完整账户/订单覆盖、干净的 `review_equity_order` 回执，以及 review 后的逐笔明确确认。
+⚠️ 本项目为个人研究与自动化基础设施，不构成投资建议，不保证收益或限制最大损失。
 
 ## 能做什么
 
-- VTI/QQQM 双基准趋势状态与 90/60/20% 股票暴露上限；
-- 15/25/35% 现金流调整回撤分档和 HALT；
-- 个股价格、市值、流动性、50/200 日线、3/6 月动量、20 日相对强度、财报窗口、新闻、普通股/可交易性与 wash sale 门禁；
-- 单股 15%、个股合计 30%、最多 2 只、每日 6 笔、主动换手 30%；
-- 将现有持仓和所有未完成买卖单一起纳入预测暴露、现金和可卖数量；
-- 对齐当前 Robinhood 工具：`review_equity_order`、`place_equity_order`、`get_equity_orders`、`cancel_equity_order`；
-- review 请求/响应绑定、行情披露、价差、新鲜度和重放检查；
-- `ref_id -> order.id` 本地 ledger、完整订单状态机与 unknown fail-closed；
-- 账户标识/凭据日志防泄漏、哈希链日志和行为偏差复盘。
+- 分析美联储、利率、通胀、就业、当日宏观日历和重大实时事件；
+- 检索 SEC/公司 IR、财报、行业轮动、市场广度、估值与波动证据；
+- 计算 VTI/QQQM 双基准趋势与 90/60/20% 股票暴露上限；
+- 执行 15/25/35% 净现金流调整回撤分档和 HALT；
+- 用价格、市值、流动性、50/200 日线、3/6 月动量、20 日相对强度、财报窗口、新闻、普通股身份和 wash sale 筛选候选；
+- 将现有持仓和全部未完成买卖单纳入投影暴露、现金和可卖数量；
+- 在通过两阶段闸门后调用 Robinhood `review_equity_order` 与 `place_equity_order`；
+- 用唯一 `ref_id`、Robinhood `order.id` 和本地 ledger 追踪部分成交、取消竞态和终态；
+- 用净现金流调整绩效与 VOO/QQQ 基准做证据化复盘。
 
-## 三种能力层
+## 单一流程
 
-| 层级 | 账户读取 | Robinhood 写操作 |
-|---|---:|---:|
-| `research` | 否 | 否 |
-| `shadow` | 可选的固定单账户只读快照 | 否 |
-| `supervised_review` | 固定单账户 | review 后向用户展示并逐笔确认，才可 place/cancel |
+```text
+实时研究
+  → 唯一账户匹配
+  → portfolio / positions / orders / fills 全量刷新
+  → 策略与风控闸门
+  → Robinhood order review
+  → 再次刷新全部可变状态
+  → review 回执绑定闸门
+  → 合规提交
+  → 订单终态对账
+```
 
-当前没有 `autonomous_live`。如果未来增加，必须使用模型不可绕过的固定账户执行 adapter，而不是仅靠 Skill 文本或 Python 脚本，并先完成独立安全审查和至少 10 个完整交易日 shadow。
+用户不会被要求管理这些内部步骤。它们的作用是防止重复下单、使用未结算现金、超过可卖数量或把已接收误报成已成交。
 
 ## 安装
 
@@ -51,38 +43,37 @@ python3 ~/.codex/skills/codex-agentic-trader/scripts/test_desk.py
 python3 ~/.codex/skills/codex-agentic-trader/scripts/test_codex_trader.py
 ```
 
-只保留 `~/.codex/skills/codex-agentic-trader`；移除或归档旧的 Robinhood Skill，避免两个规则源同时生效。
+只保留 `~/.codex/skills/codex-agentic-trader`，避免两个 Robinhood 规则源同时生效。
 
-## Robinhood 接入前提
+## Robinhood 接入
 
-1. 在 `policy/policy.json` 配置账户末四位、资金上限与策略参数。
-2. research 只需要 Robinhood 的账户无关市场工具；不要为了 research 或 shadow 提前开放账户读写工具。
-3. shadow 应提供一个名为 `robinhood-account-readonly` 的本地 MCP，只发布零参数 `get_strategy_snapshot`，并在模型外注入固定账户、分页读取、递归脱敏且固定返回 `trade_readiness=false`。本公开仓不附带任何个人账户 provisioning 或 pin；完整账户号不得进入 prompt、配置、Git，也不得用 `get_accounts` 枚举猜默认账户。
-4. shadow 运行至少 10 个完整交易日，验证快照分页、advanced order 覆盖、部分成交、取消竞态、买卖力、wash sale、日志与回滚。
-5. 只有准备进入 `supervised_review` 时，才将 Robinhood MCP 的 `enabled_tools` 精确锁定为 `policy/enabled_tools_live.json`，然后运行：
+1. 连接官方 Robinhood MCP：
+
+```bash
+codex mcp add robinhood-trading --url https://agent.robinhood.com/mcp/trading
+```
+
+2. 在 `policy/policy.json` 设置获得明确授权的现金账户末四位、本金上限和风控参数。
+3. 将 Robinhood MCP `enabled_tools` 精确限定为 `policy/enabled_tools_live.json` 中的工具，不得开放转账、提现、账户设置、期权交易或加密货币工具。
+4. 验证：
 
 ```bash
 codex mcp get robinhood-trading --json \
   | python3 ~/.codex/skills/codex-agentic-trader/scripts/runtime_scope_gate_live.py
+python3 ~/.codex/skills/codex-agentic-trader/scripts/live_gate.py --check-runtime
 ```
 
-6. 如确需监督式执行，由账户所有人在本地签发短期 mandate：
+5. 完全退出并重新打开 Codex，使新工具清单进入新任务。
 
-```bash
-python3 ~/.codex/skills/codex-agentic-trader/scripts/mandate_admin.py create \
-  --days 7 --max-order 300 --max-daily-turnover 750 --max-orders 3
-```
+## 不可放宽的边界
 
-7. 每笔仍先 `review_equity_order`，展示 Robinhood 返回的完整审核和原样 `market_data_disclosure`，取得明确确认后才可 `place_equity_order`。
-
-## 当前已知边界
-
-- Robinhood 账户读取工具要求完整 `account_number`，仅有末四位不能安全调用。
-- 当前工具目录没有向本 Skill 保证 advanced/OCO 订单的完整读取；未被独立确认时，执行会 fail-closed。
-- `get_equity_orders` 不回显 `ref_id`；提交回执必须立即持久化绑定 `ref_id -> order.id`。
-- 本地哈希链可发现普通误改，但有文件写权限者可以重算整链。
-- 双基准/均线体系是风险暴露开关，不是已经被证明能跑赢 VOO/QQQ 的 alpha 模型。
-- 15% 单股上限不是 risk-per-trade 仓位模型；波动/失效距离 sizing 仍需后续 shadow 开发。
+- 每轮 `get_accounts` 最多一次，必须唯一匹配设定末四位、active cash、`agentic_allowed=true`；
+- 禁止读取、分析或操作其他账户；
+- 完整账号不得进入 prompt、日志、Git 或报告；
+- 禁止做空、保证金、杠杆/反向 ETF、期权、加密货币、OTC、低价股、转账、提现和账户设置；
+- 仅常规交易时段 + GFD；
+- Robinhood 强制确认、披露确认或实质性警告一律停止，不得绕过；
+- `accepted` / `queued` 不是成交，必须查到订单最终状态。
 
 ## 目录
 
@@ -95,7 +86,6 @@ skills/codex-agentic-trader/
 └── scripts/
     ├── decision_gate.py
     ├── live_gate.py
-    ├── mandate_admin.py
     ├── order_ledger.py
     ├── runtime_scope_gate_live.py
     ├── journal_append.py

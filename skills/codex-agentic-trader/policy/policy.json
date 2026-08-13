@@ -1,6 +1,6 @@
 {
-  "policy_version": "2.0-20260813-supervised",
-  "note": "唯一策略参数源，只有账户所有人能改。mandate 是必要但不充分的限时限额委托，不得绕过平台确认或放宽本 policy。",
+  "policy_version": "3.0-20260813-single-flow",
+  "note": "唯一策略参数源，只有账户所有人能在代码审查后修改。用户体验只有一条自动流程；内部仍必须完成账户、订单、审核与风控核对。",
   "account_last4": "0000",
   "capital_cap": 5000.0,
   "benchmarks": ["VTI", "QQQM"],
@@ -8,8 +8,6 @@
   "max_data_age_seconds": 300,
   "max_review_age_seconds": 120,
   "max_clock_skew_seconds": 30,
-  "max_mandate_days": 30,
-  "supported_execution_modes": ["supervised_review"],
   "market_state_stock_caps": {"both_pass": 0.9, "one_pass": 0.6, "none_pass": 0.2},
   "drawdown_tiers": [
     {"threshold": 0.15, "stock_cap": 0.7},
@@ -61,10 +59,8 @@
       "material_event_risk"
     ]
   },
-  "mandate_file": "~/.codex-agentic-trader/mandate.json",
   "halt_file": "~/.codex-agentic-trader/HALT",
   "gate_state_file": "~/.codex-agentic-trader/gate_state.json",
   "order_ledger_file": "~/.codex-agentic-trader/order_ledger.json",
-  "journal_file": "~/.codex-agentic-trader/journal.jsonl",
-  "keychain_service": "com.roy.codex-agentic-trader.mandate"
+  "journal_file": "~/.codex-agentic-trader/journal.jsonl"
 }

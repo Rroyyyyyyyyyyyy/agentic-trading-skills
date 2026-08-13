@@ -1,120 +1,114 @@
 ---
 name: codex-agentic-trader
-description: Codex 专用的 Robinhood 股票/ETF 研究、账户核对、决策风控、监督式订单执行和复盘 Skill。无 mandate 时只做 shadow；有效 mandate 也只是限时限额委托，仍必须使用 Robinhood 当前 review_equity_order 回执并获得逐笔明确确认。用于 Robinhood 市场研究、现金账户持仓/购买力/订单检查、盘前盘中收盘流程、下单前审核、订单终态对账和证据化策略迭代。
+description: Codex 专用的 Robinhood 股票/ETF 自动研究与交易 Skill。自动分析宏观、金融新闻、实时要事、市场趋势、持仓与候选股，在固定现金账户和硬风控内完成订单审核、提交、终态对账和复盘。用于盘前、盘中、收盘流程，以及 Robinhood 持仓/购买力/订单核对和合规股票/ETF 操作。
 ---
 
 # Codex Agentic Trader
 
-这是唯一的 Robinhood Skill。它把研究、确定性风控、Robinhood 审核、逐笔确认、订单对账和复盘放在同一契约中。不得与另一个 Robinhood Skill 并存或交叉执行。
+这是唯一的 Robinhood Skill，对用户只呈现一条流程：
 
-策略研究见 [research-playbook.md](references/research-playbook.md)，决策卡见 [decision-card.md](references/decision-card.md)，执行契约见 [execution-contract.md](references/execution-contract.md)，不可越过的边界见 [hard-boundaries.md](references/hard-boundaries.md)。
-
-## 先判断能做到哪一层
-
-1. `research`：只读公开市场与新闻，不读账户。
-2. `shadow`：可读受信任的单账户快照，跑全部决策闸门，但不调用 review/place/cancel。这是默认模式。
-3. `supervised_review`：有效 mandate、无 HALT、工具面正确、账户精确绑定、快照与订单覆盖完整时，可以 review 订单。必须向用户展示完整审核与合规行情披露，得到该笔的明确确认后才可 place。
-
-当前发布版没有 `autonomous_live`。普通“帮我下单”、历史授权、automation 或 mandate 都不能替代 Robinhood review 之后的逐笔确认。
-
-## mandate 的意义
-
-mandate 是可审计的有限委托包络，不是身份认证、账户绑定、平台授权或绕过确认的通行证。它只有五个价值：
-
-- 明确谁在哪个时间窗口内委托了哪种执行模式；
-- 将单笔额、每日换手和订单数压到 policy 之下；
-- 绑定 policy 与工具清单指纹，任一漂移即失效；
-- 在日志中给每次审核提供 mandate_id 与到期证据；
-- 可独立撤销，使流程立即回到 shadow。
-
-TTY 输入只是一个慎重的签发仪式，不能证明“Agent 无法自己签发”。同用户 shell 可以创建 PTY、改文件或调券商工具。真正的安全边界是 Robinhood 账户权限、MCP 工具白名单、精确账户绑定、平台审核/确认和独立操作人。
-
-## 每次运行的固定序
-
-### 0. 边界自检
-
-```bash
-python3 scripts/live_gate.py --check-runtime
+```text
+实时研究 → 后台账户/订单核对 → 确定性风控 → Robinhood 审核 → 合规提交 → 终态对账 → 复盘
 ```
 
-若返回 `mode_if_run_now=shadow`，只允许市场研究和下方固定账户只读快照，不要求、也不得为此开放 live 工具面。只有准备进入 `supervised_review` 时才运行：
+用户不需要管理能力层、凭证或模式切换。账户、购买力、挂单和成交核对是每次操作前的内部必做步骤，不是用户额外流程。
+
+策略研究见 [research-playbook.md](references/research-playbook.md)，决策卡见 [decision-card.md](references/decision-card.md)，订单契约见 [execution-contract.md](references/execution-contract.md)，硬边界见 [hard-boundaries.md](references/hard-boundaries.md)。
+
+## 每次运行的固定顺序
+
+### 1. 确认时间、交易日和工具面
+
+使用美东时间。下单只允许在美股常规交易时段，只使用 DAY/GFD；休市、盘前、盘后只研究和对账。
 
 ```bash
 codex mcp get robinhood-trading --json | python3 scripts/runtime_scope_gate_live.py
+python3 scripts/live_gate.py --check-runtime
 ```
 
-live 工具面不符、mandate 无效或 HALT 存在时，不得执行新增风险订单。`runtime_scope_gate_live.py` 只校验 live 工具面，不证明账户绑定。
+任一闸门失败就停止券商操作，但可继续无账户市场研究。
 
-### 1. 确定时间与交易日
+### 2. 后台精确锁定账户
 
-使用美东时间。研究可在盘前/收盘后做；审核和下单只能在策略允许的常规时段。脚本会拒绝周末和盘外时间；休市日仍以 Robinhood 交易日历/平台拒绝为最后边界。
+每轮最多调用一次 `get_accounts`，只用于找到同时满足下列条件的唯一账户：
 
-### 2. 读取精确账户，绝不枚举
+- 末四位等于 policy `account_last4`；
+- active 现金账户；
+- `agentic_allowed=true`。
 
-完整 `account_number` 只能来自宿主信任边界（例如固定账户 adapter/Keychain 注入）或当次用户明确给出的账户。不得调 `get_accounts` 来猜默认账户，不得读取其他账户。完整账号不得进入决策 JSON、日志、Git 或报告。
+匹配数不是 1 立即停止。完整账号只在当轮 Robinhood 工具参数中使用，不得进入 prompt、日志、Git、报告或消息。绝不读取、分析或操作其他账户。
 
-shadow 模式优先调用本地 `robinhood-account-readonly` 的零参数 `get_strategy_snapshot`。调用时不得传任何参数；必须同时核验 `binding.exact_id_bound=true`、`binding.suffix_verified=true`、所需 `coverage` 全部完成且返回内容只有脱敏账户引用。该快照的 `trade_readiness=false` 是设计边界：可以研究、核对与生成 shadow 决策，绝不能用它进入 review/place/cancel。若工具不存在、返回未知字段/状态、覆盖不完整或绑定不可验证，立即降级为 `research`，不得改用 `get_accounts`。
+### 3. 刷新真实状态
 
-只有 `supervised_review` 才使用下列 Robinhood 原生账户工具，并且仍须由宿主信任边界注入同一精确账户：
+使用上一步的精确账户标识，处理全部分页并重新读取：
 
-每轮刷新：
+- `get_portfolio`：净值、真实 buying power、unleveraged buying power、pending deposits；
+- `get_equity_positions`：持仓、成本和可卖数量；
+- `get_equity_orders`：全部未完成订单、当日订单与成交；
+- `get_option_positions` / `get_option_orders`：只用于确认禁止资产和占用，绝不操作期权；
+- 本地 order ledger：按 Robinhood `order.id` 对账。
 
-- `get_portfolio`：总净值、`buying_power.buying_power`、`unleveraged_buying_power`、pending deposits；
-- `get_equity_positions`：持仓、成本、`shares_available_for_sells`；
-- `get_equity_orders`：全部未完成订单、当日订单/成交，并处理全部分页；
-- 本地 intent/order ledger：按 Robinhood `order.id` 对账；
-- `get_equity_tradability`：待审核标的当前账户可交易性。
+任何未知订单状态、分页缺失、买力不可验证、对账不平或同标的已有挂单都停止新单。
 
-Robinhood 当前工具目录未向本 Skill 保证 advanced/OCO 订单的完整读取。若未由平台或独立操作人确认，`advanced_orders_checked` 必须为 false，执行 fail-closed。
+### 4. 实时研究与提案
 
-### 3. 研究与提案
+按 [research-playbook.md](references/research-playbook.md) 重新搜索并分析：
 
-按 [research-playbook.md](references/research-playbook.md) 生成结构化提案。市场状态、回撤、持仓、挂单占用、已结算现金、wash sale、财报窗口和相对强度都必须是当轮数据。缺少反证或失效条件的提案直接放弃。
+- 美联储、利率、通胀、就业和当日宏观日历；
+- 重大公司公告、财报、SEC/IR 一手来源；
+- 地缘政治、行业轮动、市场广度、估值与波动；
+- VTI、QQQM、SGOV、现有持仓和候选股的行情、趋势、新闻和财报窗口。
 
-### 4. pre-review 确定性闸门
+区分【事实】【市场反应】【推断】。没有最强反证和可观测失效条件的候选直接放弃。
 
-按 [execution-contract.md](references/execution-contract.md) 构造 JSON，运行：
+### 5. 确定性 pre-review 闸门
+
+按 [execution-contract.md](references/execution-contract.md) 构造当轮 JSON，运行：
 
 ```bash
 python3 scripts/live_gate.py --input decision.json
 ```
 
-只有 `mode=supervised` 且 `can_review=true` 才能调 `review_equity_order`。闸门会将挂单后的风险暴露与现金一并计算；不得把模型自报的百分比当成最终风控数字。
+闸门自行计算市场/回撤上限、持仓+挂单后的投影暴露、已结算现金、可卖额、日换手、订单数和防重键。只有 `can_review=true` 才进入下一步。
 
-### 5. Robinhood review 与逐笔确认
+### 6. Robinhood 审核与提交
 
-用审批参数调 `review_equity_order`，然后刷新账户/订单/行情，将实际 request+response+observed_at_et 放入 `phase=post_review` 再跑闸门。
+调用 `review_equity_order`，然后立即重新刷新购买力、持仓、未完成订单、当日成交和行情，把真实 request/response 绑定后再跑 `phase=post_review`。
 
-必须向用户展示：标的、方向、类型、金额/数量、限价、预计执行、`order_checks` 以及 `market_data_disclosure` 的原文。之后等待当笔明确确认。没有确认就不得调 `place_equity_order`。
+仅在下列条件全部满足时调用 `place_equity_order`：
 
-### 6. 提交、终态与取消
+- `can_submit=true`；
+- `order_checks == {}`；
+- `market_data_disclosure` 存在；
+- 审核参数与提案完全一致；
+- 最新买力、持仓、挂单、成交和风险仍然通过；
+- 当前仍在常规交易时段。
 
-确认后只能提交 `approved_intent` 对应的参数，常规时段 + GFD，并使用闸门产生的唯一 `ref_id`。首次调用超时时不得换 UUID 盲重试；先通过 `get_equity_orders` 查询状态。
+每个逻辑订单使用一个独立 UUID `ref_id`。用户已在 policy 边界内预先授权合规订单，不要重复询问普通逐笔确认。但 Robinhood 如果强制平台确认、要求披露确认或返回实质性警告，必须停止并报告，不得绕过。
 
-`accepted`/`queued`/`confirmed` 不是成交。必须记录 `order.id`，跟踪 `partially_filled`、`filled`、`cancelled`、`rejected`、`failed`、`voided`、`partially_filled_rest_cancelled`、`locate_failed`等终态。任何未知状态都阻断新单。
+### 7. 终态对账
 
-取消也是真实写操作，必须再次明确确认。`cancel_equity_order accepted=true` 仅表示取消请求被接受，仍必须查到最终取消或与成交竞态的结果。
+`accepted` / `queued` / `confirmed` 不是成交。立即记录 Robinhood `order.id`，持续查询到已知终态。首次调用超时时保留原 UUID，先查订单再决定是否重试，不得换 UUID 盲目重下。
 
-### 7. 日志与复盘
+取消也必须核对最新成交和剩余数量。`cancel_equity_order accepted=true` 只表示取消请求已接收，必须再查到最终取消或与成交竞态的结果。
 
-研究、决策、review、用户确认、submission、order_state、fill/cancel/HALT 分事件追加。追加失败即停止后续执行。日志链只能发现未重算的误改，不是防篡改系统。
+### 8. 日志与复盘
 
-复盘必须同时报告策略净值与 VOO/QQQ 同区间基准，费用/滑点口径一致；样本太短时不宣称跑赢。每天最多提出一个改进候选，不自动修改 active policy。
+研究、决策、review、submission、order_state、fill/cancel/HALT 分事件追加。追加失败即停止后续操作。链式哈希只防误改，不宣称密码学防篡改。
+
+复盘同时报告策略净值与 VOO/QQQ 同区间基准，口径一致；样本少于 20 个交易日或存在基线重置时不宣称跑赢。
 
 ## 失败语义
 
-- mandate 无效：回到 shadow，不是报错后绕过。
-- HALT：阻止新增风险；只允许已有持仓的风险退出提案继续走 review+确认。
-- 数据/分页/订单状态/可卖数量不完整：fail-closed。
-- 账户绑定不可验证：只做无账户研究，不用 `get_accounts` 降级枚举。
-- 平台警告、强制确认或契约漂移：展示并停止，不解释绕过。
+- 账户匹配不唯一、帐户类型不可验证或完整账号不可用：不做账户读取或交易。
+- 数据、分页、订单状态、可卖数量、买力或对账不完整：不下单。
+- 平台警告、强制确认、契约漂移、未知提交结果：停止并报告。
+- HALT 存在时阻止新增风险；只允许已有持仓的风险退出继续过闸门。
 
-## 安装后的最小验收
+## 最小验收
 
 ```bash
 python3 scripts/test_desk.py
 python3 scripts/test_codex_trader.py
 python3 scripts/live_gate.py --check-runtime
 ```
-
-在任何真实账户写操作前，先完成至少 10 个完整交易日的 shadow 评估，并由账户所有人审核工具面、账户绑定、mandate、日志、订单对账和回滚方案。

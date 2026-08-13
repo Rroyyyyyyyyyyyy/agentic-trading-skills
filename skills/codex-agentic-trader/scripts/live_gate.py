@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Robinhood supervised-execution deterministic gate.
+"""Robinhood 自动交易确定性闸门。
 
 在 decision_gate 全量基础检查之上扩展：
-- mandate 推导 supervised/shadow；mandate 是必要但不充分的委托包络；
 - HALT 哨兵：存在时只放行风险退出卖单，其余全拒；halt_required 时闸门自写 HALT（自锁）；
 - 本地 intent 与券商订单按 Robinhood order_id 对账，不平拒新单；
 - 两阶段：pre_review → post_review；验证 Robinhood review_equity_order 真实回执；
@@ -10,18 +9,18 @@
   自己记账，与调用方声明取更严——频次/换手/幂等不再单信调用方（对抗审查 P2 修复）；
 - limit_day 单必须携带数量与限价；approved_intent 与 review_fingerprint/decision_key 绑定。
 
-当前发布版不把 mandate 当成逐笔确认：post_review 通过只会输出
-can_request_confirmation=true；获得用户对该 review 的明确确认后才可调用 place_equity_order。
+用户已对 policy 边界内的合规订单给出持续授权。post_review 在回执洁净、
+数据新鲜、对账完整且无平台实质性警告时可输出 can_submit=true。
+若 Robinhood 要求额外平台确认、披露确认或返回实质性警告，必须停止，不得绕过。
 """
 import argparse
 import fcntl
 import hashlib
 import json
 import math
-import subprocess
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -35,13 +34,12 @@ ACTIVE_ORDER_STATUSES = {"new", "queued", "confirmed", "unconfirmed", "partially
 TERMINAL_ORDER_STATUSES = {"filled", "cancelled", "rejected", "failed", "voided",
                            "partially_filled_rest_cancelled", "locate_failed"}
 VALID_ORDER_STATUSES = ACTIVE_ORDER_STATUSES | TERMINAL_ORDER_STATUSES | {"unknown"}
-MANDATE_CONFIRMATION_TEMPLATE = "I AUTHORIZE SUPERVISED ROBINHOOD TRADING {last4}"
 
 
 def _fail(violations, phase="unknown"):
     print(json.dumps({
-        "mode": "shadow", "phase": phase, "would_allow": False,
-        "can_review": False, "can_request_confirmation": False,
+        "phase": phase, "would_allow": False,
+        "can_review": False,
         "can_submit": False, "halt_required": False,
         "violations": violations,
     }, ensure_ascii=False))
@@ -111,20 +109,10 @@ def _check_snapshot_coverage(account, violations):
     for key in required:
         if coverage.get(key) is not True:
             violations.append(f"snapshot_coverage_incomplete:{key}")
-    # 当前 Robinhood MCP 未公开 advanced-order 读取工具；这是必须显式携带的差距，
-    # 不得把“工具不可用”写成“已确认为空”。平台/操作人已独立确认时才可 true。
-    if coverage.get("advanced_orders_checked") is not True:
-        violations.append("advanced_order_coverage_unverified")
-
-
-def _keychain_checksum(service):
-    try:
-        out = subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-w"],
-            capture_output=True, text=True, timeout=10)
-        return out.stdout.strip() if out.returncode == 0 else None
-    except Exception:  # noqa: BLE001
-        return None
+    # 高级订单工具当前不是连接器契约的必备项。字段必须忠实传布尔值，
+    # 但 false 不伪装成已覆盖，也不单独阻断普通股票/ETF 订单。
+    if not isinstance(coverage.get("advanced_orders_checked"), bool):
+        violations.append("advanced_order_coverage_invalid")
 
 
 def check_halt(policy):
@@ -135,73 +123,6 @@ def write_halt(policy):
     p = _expand(policy["halt_file"])
     p.parent.mkdir(parents=True, exist_ok=True)
     p.touch()
-
-
-def load_mandate(policy, now=None, skip_keychain=False):
-    path = _expand(policy["mandate_file"])
-    if not path.exists():
-        return None, "mandate_missing"
-    try:
-        mode = path.stat().st_mode & 0o777
-        if mode & 0o077:
-            return None, "mandate_permissions_too_open"
-        raw = path.read_text()
-        m = json.loads(raw)
-    except Exception:  # noqa: BLE001
-        return None, "mandate_unreadable"
-    if m.get("mandate_version") != "2.0":
-        return None, "mandate_version_unsupported"
-    if not (isinstance(m.get("mandate_id"), str) and m["mandate_id"]):
-        return None, "mandate_id_invalid"
-    if m.get("account_ref_masked") != f"****{policy['account_last4']}":
-        return None, "mandate_account_mismatch"
-    expected = MANDATE_CONFIRMATION_TEMPLATE.format(last4=policy["account_last4"])
-    if m.get("confirmation") != expected:
-        return None, "mandate_confirmation_invalid"
-    if m.get("execution_mode") not in policy["supported_execution_modes"]:
-        return None, "mandate_execution_mode_unsupported"
-    if m.get("requires_per_order_confirmation") is not True:
-        return None, "mandate_confirmation_policy_invalid"
-    issued = _parse_iso_datetime(m.get("issued_at_et"))
-    not_before = _parse_iso_datetime(m.get("not_before_et"))
-    expires = _parse_iso_datetime(m.get("expires_at_et"))
-    current = now or _now_et(policy)
-    if issued is None or not_before is None or expires is None:
-        return None, "mandate_time_invalid"
-    issued = issued.astimezone(ZoneInfo(policy["market_timezone"]))
-    not_before = not_before.astimezone(ZoneInfo(policy["market_timezone"]))
-    expires = expires.astimezone(ZoneInfo(policy["market_timezone"]))
-    current = current.astimezone(ZoneInfo(policy["market_timezone"]))
-    if not_before < issued or expires <= not_before:
-        return None, "mandate_time_invalid"
-    if expires - issued > timedelta(days=policy["max_mandate_days"]):
-        return None, "mandate_duration_exceeded"
-    if current < not_before or current > expires:
-        return None, "mandate_expired"
-    for f in ("max_order_amount", "max_daily_turnover", "max_orders_per_day"):
-        if not _is_finite_number(m.get(f)) or m[f] <= 0:
-            return None, f"mandate_invalid_{f}"
-    if m["max_order_amount"] > policy["capital_cap"]:
-        return None, "mandate_order_amount_exceeds_policy"
-    if m["max_daily_turnover"] > policy["max_daily_turnover_ratio"] * policy["capital_cap"]:
-        return None, "mandate_turnover_exceeds_policy"
-    if int(m["max_orders_per_day"]) != m["max_orders_per_day"] \
-            or m["max_orders_per_day"] > policy["max_orders_per_day"]:
-        return None, "mandate_orders_exceed_policy"
-    if m.get("policy_sha256") != _canonical_hash(policy):
-        return None, "mandate_policy_drift"
-    try:
-        toolset = json.loads(TOOLSET_PATH.read_text())
-    except Exception:  # noqa: BLE001
-        return None, "mandate_toolset_unreadable"
-    if m.get("toolset_sha256") != _canonical_hash(toolset):
-        return None, "mandate_toolset_drift"
-    if not skip_keychain:
-        stored = _keychain_checksum(policy["keychain_service"])
-        actual = hashlib.sha256(raw.encode()).hexdigest()
-        if stored is None or stored != actual:
-            return None, "mandate_checksum_mismatch"
-    return m, "ok"
 
 
 # ---------- 闸门本地状态账本（P2 修复） ----------
@@ -396,25 +317,22 @@ def check_review(review, policy, prop, used_fingerprints, violations, now=None):
     return fingerprint
 
 
-def evaluate(payload, policy, now=None, skip_keychain=False, state=None):
+def evaluate(payload, policy, now=None, state=None):
     import decision_gate
 
     phase = payload.get("phase")
     if phase not in ("pre_review", "post_review"):
-        return {"mode": "shadow", "phase": str(phase), "would_allow": False,
-                "can_review": False, "can_request_confirmation": False,
+        return {"phase": str(phase), "would_allow": False,
+                "can_review": False,
                 "can_submit": False, "halt_required": False,
                 "violations": ["invalid_phase"]}
     if "mode" in payload:
-        return {"mode": "shadow", "phase": phase, "would_allow": False,
-                "can_review": False, "can_request_confirmation": False,
+        return {"phase": phase, "would_allow": False,
+                "can_review": False,
                 "can_submit": False, "halt_required": False,
                 "violations": ["mode_must_not_be_declared"]}
 
     halted = check_halt(policy)
-    mandate, mandate_reason = load_mandate(policy, now=now, skip_keychain=skip_keychain)
-    mode = "supervised" if mandate else "shadow"
-
     prop = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else {}
     is_risk_exit = (prop.get("side") == "sell"
                     and prop.get("trigger") in policy["risk_exit_triggers"])
@@ -468,17 +386,7 @@ def evaluate(payload, policy, now=None, skip_keychain=False, state=None):
     elif limit_price is not None:
         violations.append("limit_price_forbidden_for_market_order")
 
-    # mandate 额度（风险退出卖单豁免）
     amount = prop.get("amount")
-    if mandate and _is_finite_number(amount) and not is_risk_exit:
-        if amount > mandate["max_order_amount"] + 1e-9:
-            violations.append("mandate_order_amount_exceeded")
-        turnover = merged_hist.get("turnover_today")
-        if _is_finite_number(turnover) and turnover + amount > mandate["max_daily_turnover"] + 1e-9:
-            violations.append("mandate_daily_turnover_exceeded")
-        orders_today = merged_hist.get("orders_today")
-        if _is_finite_number(orders_today) and orders_today >= mandate["max_orders_per_day"]:
-            violations.append("mandate_daily_order_limit_reached")
 
     # 对账
     check_reconciliation(recon_sub, violations)
@@ -503,28 +411,20 @@ def evaluate(payload, policy, now=None, skip_keychain=False, state=None):
     violations = list(dict.fromkeys(violations))
     would_allow = not violations
     result = {
-        "mode": mode,
         "phase": phase,
         "would_allow": would_allow,
         "halt_required": halt_required,
         "decision_key": base.get("decision_key"),
         "violations": violations,
         "derived": derived,
-        "mandate_status": mandate_reason,
         "can_review": False,
-        "can_request_confirmation": False,
         "can_submit": False,
     }
-    if mandate:
-        result["derived"]["mandate_expires_at_et"] = mandate["expires_at_et"]
-    if mode == "shadow":
-        result["shadow_would_allow"] = would_allow
-        return result
     if would_allow and phase == "pre_review":
         result["can_review"] = True
     if would_allow and phase == "post_review":
         ref_id = str(uuid.uuid4())
-        result["can_request_confirmation"] = True
+        result["can_submit"] = True
         result["approved_intent"] = {
             "symbol": prop.get("symbol"),
             "side": prop.get("side"),
@@ -539,7 +439,7 @@ def evaluate(payload, policy, now=None, skip_keychain=False, state=None):
             "time_in_force": "gfd",
             "review_fingerprint": review_fingerprint,
             "ref_id": ref_id,
-            "requires_explicit_confirmation": True,
+            "requires_explicit_confirmation": False,
         }
         result["required_market_data_disclosure"] = (review_sub or {}).get(
             "response", {}).get("market_data_disclosure")
@@ -548,16 +448,12 @@ def evaluate(payload, policy, now=None, skip_keychain=False, state=None):
 
 def check_runtime(policy):
     halted = check_halt(policy)
-    mandate, reason = load_mandate(policy)
     report = {
         "halt_active": halted,
-        "mandate_status": reason,
-        "mode_if_run_now": "supervised" if mandate and not halted else "shadow",
+        "trading_enabled_by_policy": not halted,
         "policy_version": policy.get("policy_version"),
         "note": "HALT 存在时仅允许风险退出卖单" if halted else None,
     }
-    if mandate:
-        report["mandate_expires_at_et"] = mandate["expires_at_et"]
     print(json.dumps(report, ensure_ascii=False))
     sys.exit(0)
 
@@ -621,10 +517,9 @@ def main():
                 result["violations"].append("halt_write_failed")
                 result["would_allow"] = False
                 result["can_review"] = False
-                result["can_request_confirmation"] = False
                 result["can_submit"] = False
-        # post_review 批准时预留 ref_id 并消耗该回执。用户最后放弃也保守计入当日频次。
-        if result.get("can_request_confirmation"):
+        # post_review 批准时预留 ref_id 并消耗该回执。
+        if result.get("can_submit"):
             try:
                 intent = result["approved_intent"]
                 record_submission(state, result["decision_key"],
@@ -634,7 +529,7 @@ def main():
             except Exception:  # noqa: BLE001
                 result["violations"].append("gate_state_write_failed")
                 result["would_allow"] = False
-                result["can_request_confirmation"] = False
+                result["can_submit"] = False
     print(json.dumps(result, ensure_ascii=False))
     sys.exit(0 if result["would_allow"] else 1)
 

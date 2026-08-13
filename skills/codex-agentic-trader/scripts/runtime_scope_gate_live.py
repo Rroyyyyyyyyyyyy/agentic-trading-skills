@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Codex 侧 Robinhood MCP 工具面闸门（supervised_review）。
+"""Codex 侧 Robinhood MCP 工具面闸门。
 
 用法：codex mcp get robinhood-trading --json | python3 runtime_scope_gate_live.py
 
 校验 server 名、官方 URL、enabled 和 enabled_tools 精确一致。它只证明
-当前 Codex 配置的工具面，不证明账户绑定、不代替 Robinhood 平台确认，
+当前 Codex 配置的工具面，不证明账户匹配、不代替 Robinhood 平台约束，
 更不是防止同用户 shell 绕过的安全边界。
 """
 import json
@@ -33,11 +33,10 @@ def evaluate_scope(cfg, expected):
         return {"scope_pass": False, "extra": extra, "missing": missing}
     return {
         "scope_pass": True,
-        "runtime_mode": "supervised_review",
         "tool_count": len(actual),
         "account_binding_verified": False,
-        "autonomous_execution_authorized": False,
-        "note": "tool surface only; exact account binding and broker confirmation are separate prerequisites",
+        "trading_tools_ready": True,
+        "note": "tool surface only; exact account match, fresh broker state and clean order review remain required",
     }
 
 

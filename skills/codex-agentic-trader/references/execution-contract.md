@@ -2,7 +2,7 @@
 
 本契约与当前 Robinhood MCP 的 `review_equity_order` / `place_equity_order` / `get_equity_orders` / `cancel_equity_order` 对齐。工具契约发生变化时必须 fail-closed，不得靠字段猜测兼容。
 
-## 1. 三段流程
+## 1. 固定流程
 
 ```text
 fresh account + positions + orders + fills + market snapshot
@@ -10,14 +10,12 @@ fresh account + positions + orders + fills + market snapshot
   -> can_review=true -> review_equity_order
   -> refresh all mutable state
   -> phase=post_review -> live_gate binds actual request/response
-  -> can_request_confirmation=true
-  -> show review + verbatim market_data_disclosure to user
-  -> explicit per-order confirmation
+  -> can_submit=true
   -> place_equity_order with the bound arguments and ref_id
   -> get_equity_orders(order_id=...) until terminal
 ```
 
-`can_submit` 在闸门输出中恒为 false，因为最后授权发生在用户看到 review 之后，不应由一个事前 JSON 布尔值代替。
+`can_submit=true` 只表示该笔已通过当轮账户、风控、对账和 Robinhood 审核绑定。如平台另行要求确认、披露确认或返回实质性警告，必须停止，不得绕过。
 
 ## 2. 决策输入
 
@@ -49,7 +47,7 @@ fresh account + positions + orders + fills + market snapshot
       "open_equity_orders_complete": true,
       "today_equity_orders_complete": true,
       "today_fills_complete": true,
-      "advanced_orders_checked": true
+    "advanced_orders_checked": false
     }
   },
   "reconciliation": {
@@ -68,7 +66,7 @@ fresh account + positions + orders + fills + market snapshot
 - `cash_available_settled` 必须是现金账户的 `unleveraged_buying_power`，不是账面 cash。
 - 持仓卖出上限用 `shares_available_for_sells * fresh quote`，不用总 quantity。
 - `open_orders.remaining_notional` 必须含未成交剩余；闸门会把挂单纳入现金、仓位、单股和单标的限制。
-- `advanced_orders_checked=true` 只能表示已通过独立可信渠道核对，不得将“工具不存在”填成 true。
+- `advanced_orders_checked` 必须忠实记录当轮覆盖情况。连接器未提供独立高级订单工具时填 false，不得伪造为 true；股票订单仍必须通过 `get_equity_orders` 全分页对账。
 - 完整账号不在此 JSON 中。
 
 ## 3. proposal 的订单表示
@@ -137,37 +135,14 @@ fresh account + positions + orders + fills + market snapshot
 
 Robinhood 的实际回执没有 `preview_id`、`preflight_status`、`warnings` 或 `quoted_price`。任何使用这些旧字段的实现都与当前契约不兼容。
 
-## 5. mandate v2
-
-```json
-{
-  "mandate_version": "2.0",
-  "mandate_id": "<uuid>",
-  "account_ref_masked": "****0000",
-  "execution_mode": "supervised_review",
-  "requires_per_order_confirmation": true,
-  "issued_at_et": "<aware ISO 8601>",
-  "not_before_et": "<aware ISO 8601>",
-  "expires_at_et": "<aware ISO 8601>",
-  "max_order_amount": 600,
-  "max_daily_turnover": 1500,
-  "max_orders_per_day": 3,
-  "policy_sha256": "<canonical policy hash>",
-  "toolset_sha256": "<canonical toolset hash>",
-  "confirmation": "I AUTHORIZE SUPERVISED ROBINHOOD TRADING 0000"
-}
-```
-
-mandate 是 necessary but not sufficient：还必须有受信任账户绑定、当前工具面、无 HALT、完整账户覆盖、洁净 review 和当笔用户确认。Keychain 里的 mandate 哈希只用于检测文件漂移，不证明签发人身份。
-
-## 6. 订单提交与幂等
+## 5. 订单提交与幂等
 
 - 每个逻辑订单首次提交生成一个 UUID `ref_id`。
 - 传输超时时保留该 UUID；不得把未知当拒绝后换 UUID 重下。
 - Robinhood `get_equity_orders` 不对外回显 `ref_id`。因此本地 ledger 必须在 place 成功回执时永久绑定 `ref_id -> order.id`；后续对账以 `order.id` 为准。
 - 未得到 place 回执的超时只能标记 `submission_unknown`，停止新单并人工核对。
 
-## 7. 状态集
+## 6. 状态集
 
 活动：`new`, `queued`, `confirmed`, `unconfirmed`, `partially_filled`, `pending_cancelled`, `locating`。
 
@@ -175,6 +150,6 @@ mandate 是 necessary but not sufficient：还必须有受信任账户绑定、�
 
 未来出现任何未知状态时一律 fail-closed，先更新契约与回归测试。
 
-## 8. 中止与 HALT
+## 7. 中止与 HALT
 
-HALT 阻止一切新增风险的 review/place。对已有持仓的 `drawdown_action` / `thesis_break` 卖出提案，仍必须通过新鲜账户快照、review 和逐笔确认。
+HALT 阻止一切新增风险的 review/place。对已有持仓的 `drawdown_action` / `thesis_break` 卖出提案，仍必须通过新鲜账户快照、对账和 Robinhood 审核。

@@ -1,8 +1,8 @@
 interface:
   display_name: "Codex Agentic Trader"
-  short_description: "Robinhood 研究、账户核对、监督式执行与确定性风控"
+  short_description: "Robinhood 市场研究、金融新闻、确定性风控与自动交易"
   brand_color: "#00C805"
-  default_prompt: "Use $codex-agentic-trader to audit a Robinhood stock or ETF decision, apply deterministic risk gates, and keep execution supervised."
+  default_prompt: "Use $codex-agentic-trader to research current markets and financial news, verify the configured Robinhood cash account and orders, apply deterministic risk gates, and execute only clean policy-compliant stock or ETF actions through the fixed workflow."
 
 dependencies:
   tools:

@@ -19,9 +19,9 @@ SENSITIVE_KEYS = {"password", "token", "secret", "api_key", "apikey", "credentia
                   "account_number", "account_id", "ssn"}
 ALLOWED_ACCOUNT_KEYS = {"account_ref_masked", "account_last4"}
 ALLOWED_EVENT_TYPES = {
-    "research", "decision", "review", "confirmation", "submission", "order_state",
-    "fill", "cancel_request", "cancel_state", "halt", "mandate_status", "daily_review",
-    "shadow_decision", "reconciliation_mismatch",
+    "research", "decision", "review", "submission", "order_state",
+    "fill", "cancel_request", "cancel_state", "halt", "daily_review",
+    "reconciliation_mismatch",
 }
 
 
