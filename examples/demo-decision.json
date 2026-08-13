@@ -4,22 +4,39 @@
   "as_of_et": "2026-08-13T13:00:00-04:00",
   "data_age_seconds": 60,
   "account": {
+    "account_type": "cash",
+    "margin_enabled": false,
+    "strategy_external_capital": 5000.0,
     "equity": 5000.0,
     "cash_available_settled": 1000.0,
+    "broker_buying_power": 1000.0,
+    "unleveraged_buying_power": 1000.0,
     "peak_equity_adjusted": 5100.0,
     "positions": [
-      {"symbol": "VTI", "value": 2200.0, "asset_class": "etf"},
-      {"symbol": "SGOV", "value": 900.0, "asset_class": "cash_equiv"}
-    ]
+      {"symbol": "VTI", "value": 2200.0, "sellable_value": 2200.0, "asset_class": "etf"},
+      {"symbol": "SGOV", "value": 900.0, "sellable_value": 900.0, "asset_class": "cash_equiv"}
+    ],
+    "open_orders": []
   },
   "market_state": {"benchmark_a_pass": true, "benchmark_b_pass": true},
   "history": {"orders_today": 0, "turnover_today": 0.0, "used_decision_keys": []},
   "proposal": {
-    "symbol": "QQQM", "side": "buy", "amount": 500.0, "asset_class": "etf",
-    "trigger": "weight_deviation", "order_type": "market_day",
+    "symbol": "QQQM",
+    "side": "buy",
+    "amount": 500.0,
+    "quantity": null,
+    "limit_price": null,
+    "asset_class": "etf",
+    "trigger": "weight_deviation",
+    "order_type": "market_day",
     "thesis": "QQQM 实际权重低于目标超过 3 个百分点",
     "counter_thesis": "科技集中度上升，与长期核心资产重叠",
     "invalidation": "市场状态降档或回撤触发",
-    "declares": {"is_leveraged_or_inverse": false, "is_otc": false}
+    "declares": {
+      "is_leveraged_or_inverse": false,
+      "is_otc": false,
+      "wash_sale_conflict": false,
+      "weight_deviation_pct": 0.04
+    }
   }
 }

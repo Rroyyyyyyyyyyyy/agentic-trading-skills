@@ -1,0 +1,16 @@
+interface:
+  display_name: "Codex Agentic Trader"
+  short_description: "Robinhood 研究、账户核对、监督式执行与确定性风控"
+  brand_color: "#00C805"
+  default_prompt: "Use $codex-agentic-trader to audit a Robinhood stock or ETF decision, apply deterministic risk gates, and keep execution supervised."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "robinhood-trading"
+      description: "Robinhood official MCP for market data, account reads, order review, placement, cancellation, and status checks."
+      transport: "streamable_http"
+      url: "https://agent.robinhood.com/mcp/trading"
+
+policy:
+  allow_implicit_invocation: true
