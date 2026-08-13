@@ -1,8 +1,8 @@
 interface:
   display_name: "Codex Agentic Trader"
-  short_description: "Robinhood 市场研究、金融新闻、确定性风控与自动交易"
+  short_description: "Robinhood 双分析、动态判断、双基准考核与自动交易"
   brand_color: "#00C805"
-  default_prompt: "Use $codex-agentic-trader to research current markets and financial news, verify the configured Robinhood cash account and orders, apply deterministic risk gates, and execute only clean policy-compliant stock or ETF actions through the fixed workflow."
+  default_prompt: "Use $codex-agentic-trader for the daily premarket and post-close analyses, dynamic 30-minute or 2-hour operation checks based on real buying power, VOO/QQQ performance review, persistent daily lessons, and only clean policy-compliant Robinhood stock or ETF actions."
 
 dependencies:
   tools:

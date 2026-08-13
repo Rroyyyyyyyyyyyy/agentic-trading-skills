@@ -9,8 +9,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import behavior_review
+import cadence_gate
 import decision_gate
 import journal_append
+import performance_review
 
 POLICY = decision_gate.load_policy()
 NOW = datetime(2026, 8, 13, 15, 42, tzinfo=ZoneInfo("America/New_York"))
@@ -289,6 +291,75 @@ class BehaviorTests(unittest.TestCase):
                                     "symbol": "A", "side": "buy", "amount": 100.0})
         findings = behavior_review.analyze(behavior_review.load_fills(log), 6)
         self.assertTrue(all(not row["flag"] for row in findings))
+
+
+class CadenceTests(unittest.TestCase):
+    def row(self, clock, buying_power=100.0, trading=True, urgent=False):
+        return cadence_gate.evaluate({
+            "as_of_et": f"2026-08-13T{clock}:00-04:00",
+            "is_trading_day": trading,
+            "unleveraged_buying_power": buying_power,
+            "urgent_risk_event": urgent,
+        }, POLICY)
+
+    def test_two_full_analyses(self):
+        self.assertEqual(self.row("08:30")["action"], "full_preopen_analysis")
+        close = self.row("17:30")
+        self.assertTrue(close["full_analysis"])
+        self.assertTrue(close["send_daily_report"])
+        self.assertTrue(close["run_evolution"])
+
+    def test_sufficient_buying_power_every_half_hour(self):
+        result = self.row("10:30", buying_power=20.0)
+        self.assertTrue(result["operation_decision"])
+        self.assertTrue(result["trade_permitted_by_cadence"])
+
+    def test_insufficient_buying_power_between_slots(self):
+        result = self.row("10:30", buying_power=19.99)
+        self.assertEqual(result["action"], "account_order_probe")
+        self.assertFalse(result["operation_decision"])
+
+    def test_insufficient_buying_power_two_hour_slot(self):
+        result = self.row("12:00", buying_power=19.99)
+        self.assertTrue(result["operation_decision"])
+        self.assertTrue(result["trade_permitted_by_cadence"])
+
+    def test_urgent_event_does_not_wait(self):
+        result = self.row("11:30", buying_power=0.0, urgent=True)
+        self.assertTrue(result["operation_decision"])
+
+    def test_closed_day_never_operates(self):
+        result = self.row("12:00", buying_power=100.0, trading=False)
+        self.assertFalse(result["operation_decision"])
+        self.assertFalse(result["trade_permitted_by_cadence"])
+
+
+class PerformanceReviewTests(unittest.TestCase):
+    def period(self, days=20, strategy=0.05, voo=0.03, qqq=0.04):
+        return {"label": f"{days}d", "trading_days": days,
+                "strategy_return": strategy, "voo_return": voo,
+                "qqq_return": qqq, "same_interval": True,
+                "cash_flow_adjusted": True, "net_of_costs": True}
+
+    def test_can_claim_only_after_twenty_days_and_beating_both(self):
+        result = performance_review.evaluate({"periods": [self.period()]}, POLICY)
+        self.assertTrue(result["periods"][0]["can_claim_outperformance"])
+        self.assertFalse(result["expand_qualified_stock_search"])
+
+    def test_underperformance_expands_search_not_trade_authority(self):
+        result = performance_review.evaluate({"periods": [
+            self.period(days=5, strategy=0.01, voo=0.02, qqq=0.03)]}, POLICY)
+        self.assertTrue(result["expand_qualified_stock_search"])
+        self.assertFalse(result["trade_authorized"])
+
+    def test_short_history_cannot_claim(self):
+        result = performance_review.evaluate({"periods": [self.period(days=5)]}, POLICY)
+        self.assertFalse(result["periods"][0]["can_claim_outperformance"])
+
+    def test_requires_cash_flow_and_cost_alignment(self):
+        row = self.period(); row["cash_flow_adjusted"] = False
+        with self.assertRaises(ValueError):
+            performance_review.evaluate({"periods": [row]}, POLICY)
 
 
 if __name__ == "__main__":

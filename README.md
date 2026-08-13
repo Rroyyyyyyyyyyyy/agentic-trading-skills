@@ -17,6 +17,10 @@
 - 在通过两阶段闸门后调用 Robinhood `review_equity_order` 与 `place_equity_order`；
 - 用唯一 `ref_id`、Robinhood `order.id` 和本地 ledger 追踪部分成交、取消竞态和终态；
 - 用净现金流调整绩效与 VOO/QQQ 基准做证据化复盘。
+- 每天固定 08:30 ET 盘前和 17:30 ET 收盘后两次完整分析，且只在收盘后生成一个日报版本；
+- 按真实无杠杆购买力在盘中切换 30 分钟或 2 小时的完整操作判断频率；
+- 以净现金流调整、扣成本后的同区间收益同时跑赢 VOO 与 QQQ 为目标，落后时扩大合格个股扫描但不放宽风控；
+- 将每日事实、决策、成交、反证、基准差和教训写入私有 `daily_review`，供后续分析持续使用。
 
 ## 单一流程
 
@@ -33,6 +37,8 @@
 ```
 
 用户不会被要求管理这些内部步骤。它们的作用是防止重复下单、使用未结算现金、超过可卖数量或把已接收误报成已成交。
+
+盘中频率由 `cadence_gate.py` 确定：购买力至少覆盖最小订单和现金缓冲时每 30 分钟判断；不足时只在 10:00、12:00、14:00、16:00 ET 做完整判断，重大风险和订单异常除外。`performance_review.py` 只负责客观比较 VOO/QQQ，不直接授权交易，也不承诺收益。
 
 ## 安装
 
@@ -90,6 +96,8 @@ skills/codex-agentic-trader/
     ├── runtime_scope_gate_live.py
     ├── journal_append.py
     ├── behavior_review.py
+    ├── cadence_gate.py
+    ├── performance_review.py
     └── test_*.py
 ```
 

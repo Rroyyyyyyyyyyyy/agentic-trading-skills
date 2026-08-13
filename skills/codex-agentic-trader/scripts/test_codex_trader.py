@@ -286,6 +286,9 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("place_equity_order", skill)
         self.assertIn("can_submit=true", skill)
         self.assertIn("用户不需要管理能力层、凭证或模式切换", skill)
+        self.assertIn("每天只做两次完整分析", skill)
+        self.assertIn("performance_review.py", skill)
+        self.assertIn("cadence_gate.py", skill)
 
 
 class RuntimeScopeTests(unittest.TestCase):

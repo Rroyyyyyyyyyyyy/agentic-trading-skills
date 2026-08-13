@@ -21,6 +21,8 @@ description: Codex 专用的 Robinhood 股票/ETF 自动研究与交易 Skill。
 
 使用美东时间。下单只允许在美股常规交易时段，只使用 DAY/GFD；休市、盘前、盘后只研究和对账。
 
+每天只做两次完整分析：08:30 ET 盘前与 17:30 ET 收盘后。17:30 分析结束后只生成一个当日版本的日报，并完成当日知识留存与进化评估。
+
 ```bash
 codex mcp get robinhood-trading --json | python3 scripts/runtime_scope_gate_live.py
 python3 scripts/live_gate.py --check-runtime
@@ -50,7 +52,20 @@ python3 scripts/live_gate.py --check-runtime
 
 任何未知订单状态、分页缺失、买力不可验证、对账不平或同标的已有挂单都停止新单。
 
-### 4. 实时研究与提案
+### 4. 按购买力决定盘中判断频率
+
+把最新 `unleveraged_buying_power`、交易日状态和风险异常传入：
+
+```bash
+python3 scripts/cadence_gate.py --input cadence.json
+```
+
+- 购买力至少覆盖最小订单金额和现金缓冲时，09:30-16:00 ET 每 30 分钟做一次操作判断；
+- 购买力不足时，每 30 分钟只快速核对购买力、挂单和成交，仅在 10:00、12:00、14:00、16:00 ET 做完整买卖判断；
+- 持仓逻辑破坏、回撤风控、重大突发风险或订单异常不等待两小时；
+- cadence 只决定是否进入判断，不授权交易。账户或购买力不可验证仍 fail closed。
+
+### 5. 实时研究与提案
 
 按 [research-playbook.md](references/research-playbook.md) 重新搜索并分析：
 
@@ -61,7 +76,9 @@ python3 scripts/live_gate.py --check-runtime
 
 区分【事实】【市场反应】【推断】。没有最强反证和可观测失效条件的候选直接放弃。
 
-### 5. 确定性 pre-review 闸门
+绩效目标是用净现金流调整、扣成本的同区间收益同时跑赢 VOO 与 QQQ。运行 `performance_review.py` 做确定性比较。有效 5 个交易日以上落后任一基准时，扩大合格个股研究范围并提高候选优先级；只有候选通过全部硬门时才可积极建仓、减仓或轮换。落后本身不是交易触发，不能强制选股、提高仓位上限或保证利润。
+
+### 6. 确定性 pre-review 闸门
 
 按 [execution-contract.md](references/execution-contract.md) 构造当轮 JSON，运行：
 
@@ -71,7 +88,7 @@ python3 scripts/live_gate.py --input decision.json
 
 闸门自行计算市场/回撤上限、持仓+挂单后的投影暴露、已结算现金、可卖额、日换手、订单数和防重键。只有 `can_review=true` 才进入下一步。
 
-### 6. Robinhood 审核与提交
+### 7. Robinhood 审核与提交
 
 调用 `review_equity_order`，然后立即重新刷新购买力、持仓、未完成订单、当日成交和行情，把真实 request/response 绑定后再跑 `phase=post_review`。
 
@@ -86,17 +103,21 @@ python3 scripts/live_gate.py --input decision.json
 
 每个逻辑订单使用一个独立 UUID `ref_id`。用户已在 policy 边界内预先授权合规订单，不要重复询问普通逐笔确认。但 Robinhood 如果强制平台确认、要求披露确认或返回实质性警告，必须停止并报告，不得绕过。
 
-### 7. 终态对账
+### 8. 终态对账
 
 `accepted` / `queued` / `confirmed` 不是成交。立即记录 Robinhood `order.id`，持续查询到已知终态。首次调用超时时保留原 UUID，先查订单再决定是否重试，不得换 UUID 盲目重下。
 
 取消也必须核对最新成交和剩余数量。`cancel_equity_order accepted=true` 只表示取消请求已接收，必须再查到最终取消或与成交竞态的结果。
 
-### 8. 日志与复盘
+### 9. 日志、日报与进化
 
 研究、决策、review、submission、order_state、fill/cancel/HALT 分事件追加。追加失败即停止后续操作。链式哈希只防误改，不宣称密码学防篡改。
 
-复盘同时报告策略净值与 VOO/QQQ 同区间基准，口径一致；样本少于 20 个交易日或存在基线重置时不宣称跑赢。
+17:30 ET 完成唯一日报：当日真实操作、盘前/盘后结论、持仓/现金/净值、风险、策略收益、VOO/QQQ 同区间收益、超额差、下一交易日触发条件。相同正文发送给多个既有收件人仍算一个日报版本；不得盘中重复发送日报。
+
+收盘后追加一个 `daily_review` 事件，保存事实、决策、成交结果、错失机会、反证、基准差、最强教训和次日条件。下一次盘前分析先读取最近 20 个 `daily_review` 与成交行为统计，让新分析继承历史证据。每天最多提出一个有测试、评价指标和回滚方案的改进；自动积累知识不等于自动放宽 policy、账户边界或风险上限。
+
+复盘的策略收益必须净现金流调整并扣费用/滑点，与 VOO/QQQ 使用相同区间；样本少于 20 个交易日或存在基线重置时不宣称跑赢。
 
 ## 失败语义
 
@@ -110,5 +131,7 @@ python3 scripts/live_gate.py --input decision.json
 ```bash
 python3 scripts/test_desk.py
 python3 scripts/test_codex_trader.py
+python3 scripts/cadence_gate.py --input cadence.json
+python3 scripts/performance_review.py --input performance.json
 python3 scripts/live_gate.py --check-runtime
 ```
