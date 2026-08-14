@@ -1,5 +1,5 @@
 {
-  "_note": "Codex 侧 robinhood-trading MCP 的 enabled_tools 必须与本清单精确一致（多一少一都 fail）。写工具命名以 Roy 首次 OAuth 后 `codex mcp get robinhood-trading --json` 的实际输出为准——若与本清单不符，scope gate 会 fail-closed，由 Roy 核实后更新本文件（这是唯一允许的更新路径）。",
+  "_note": "2026-08-13 按 Robinhood 当前官方 MCP 契约核对。单一自动流程仅允许这些市场、账户只读和股票/ETF 订单工具；契约漂移一律 fail-closed。",
   "expected_tools": [
     "search",
     "get_equity_quotes",
@@ -13,12 +13,18 @@
     "get_indexes",
     "get_index_quotes",
     "get_index_historicals",
+    "get_accounts",
     "get_portfolio",
     "get_equity_positions",
     "get_equity_orders",
-    "preview_order",
-    "place_order",
-    "cancel_order",
-    "get_order"
+    "get_option_positions",
+    "get_option_orders",
+    "get_equity_tradability",
+    "get_equity_tax_lots",
+    "get_pnl_trade_history",
+    "get_realized_pnl",
+    "review_equity_order",
+    "place_equity_order",
+    "cancel_equity_order"
   ]
 }

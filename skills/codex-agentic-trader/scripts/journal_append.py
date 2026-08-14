@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""链式交易/决策日志追加器（继承 robinhood-agentic-trader 的 append_audit 思想，简化版）。
+"""链式交易/决策日志追加器。
 
 - JSONL，每行 {seq, prev_hash, event, hash}；hash = sha256(seq|prev_hash|event 规范化 JSON)。
 - 追加前校验整条既有链；断链即拒（防误改，不防有全文件写权限者的篡改）。
-- 拦截敏感键与疑似完整账号（8-20 位纯数字字符串值）。
+- 拦截敏感键与疑似完整账号（字符串、整数、可整除浮点均检查）。
 - flock 排他 + fsync；任何失败非 0 退出——调用方必须停止流程。
 """
 import argparse
 import fcntl
 import hashlib
 import json
+import math
+import re
 import sys
 from pathlib import Path
 
 SENSITIVE_KEYS = {"password", "token", "secret", "api_key", "apikey", "credential",
                   "account_number", "account_id", "ssn"}
+ALLOWED_ACCOUNT_KEYS = {"account_ref_masked", "account_last4"}
+ALLOWED_EVENT_TYPES = {
+    "research", "decision", "review", "submission", "order_state",
+    "fill", "cancel_request", "cancel_state", "halt", "daily_review",
+    "reconciliation_mismatch",
+}
 
 
 def _canon(obj):
@@ -28,8 +36,12 @@ def _entry_hash(seq, prev_hash, event):
 def _scan(obj, path="$"):
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if isinstance(k, str) and k.lower() in SENSITIVE_KEYS:
-                raise ValueError(f"sensitive_key:{path}.{k}")
+            if isinstance(k, str):
+                lowered = k.lower()
+                normalized = "".join(ch for ch in lowered if ch.isalnum())
+                if (lowered in SENSITIVE_KEYS
+                        or ("account" in normalized and lowered not in ALLOWED_ACCOUNT_KEYS)):
+                    raise ValueError(f"sensitive_key:{path}.{k}")
             _scan(v, f"{path}.{k}")
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
@@ -54,6 +66,9 @@ def _scan(obj, path="$"):
             stripped = stripped.replace(sep, "")
         if _run(obj, 8) or _run(stripped, 10):
             raise ValueError(f"account_like_value:{path}")
+    elif isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise ValueError(f"non_finite_numeric_value:{path}")
 
 
 def verify_chain(lines):
@@ -70,8 +85,13 @@ def verify_chain(lines):
 
 def append(log_path, event):
     _scan(event)
-    if not isinstance(event.get("type"), str) or not event["type"]:
+    if event.get("type") not in ALLOWED_EVENT_TYPES:
         raise ValueError("event_type_required")
+    if "account_last4" in event and not re.fullmatch(r"\d{4}", str(event["account_last4"])):
+        raise ValueError("account_last4_invalid")
+    if "account_ref_masked" in event and not re.fullmatch(
+            r"\*\*\*\*\d{4}", str(event["account_ref_masked"])):
+        raise ValueError("account_ref_masked_invalid")
     p = Path(log_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a+") as fh:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""行为画像（借鉴 HKUDS Vibe-Trading 的 Shadow Account 思想，本地简化实现）。
+"""行为画像（借鉴 HKUDS Vibe-Trading 的隔离账户评估思想，本地简化实现）。
 
 读链式日志中的 fill 事件，检测四类行为偏差并给出 if-then 建议。只做统计呈现，
 不自动改任何策略参数；样本不足时如实标注 insufficient_data，不硬给结论。

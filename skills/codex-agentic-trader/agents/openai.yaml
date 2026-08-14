@@ -1,0 +1,16 @@
+interface:
+  display_name: "Codex Agentic Trader"
+  short_description: "Robinhood 双分析、动态判断、双基准考核与自动交易"
+  brand_color: "#00C805"
+  default_prompt: "Use $codex-agentic-trader for daily premarket and post-close analyses, buying-power-aware operation checks, the 100-day $2,500 net-profit goal, daily and rolling VOO/QQQ scoring, deterministic controlled offense only inside existing caps, persistent lessons, and clean policy-compliant Robinhood stock or ETF actions."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "robinhood-trading"
+      description: "Robinhood official MCP for market data, account reads, order review, placement, cancellation, and status checks."
+      transport: "streamable_http"
+      url: "https://agent.robinhood.com/mcp/trading"
+
+policy:
+  allow_implicit_invocation: true

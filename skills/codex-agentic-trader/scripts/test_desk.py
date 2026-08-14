@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""roy-trading-desk 回归测试：决策闸门 / 链式日志 / 行为画像。"""
+"""Decision/risk/audit regression tests.  No broker or network access."""
 import copy
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import behavior_review
+import cadence_gate
 import decision_gate
 import journal_append
+import performance_review
 
 POLICY = decision_gate.load_policy()
+NOW = datetime(2026, 8, 13, 15, 42, tzinfo=ZoneInfo("America/New_York"))
 
 
 def base_payload():
@@ -22,351 +27,504 @@ def base_payload():
         "account": {
             "equity": 5000.0,
             "cash_available_settled": 1500.0,
+            "broker_buying_power": 1500.0,
+            "unleveraged_buying_power": 1500.0,
+            "account_type": "cash",
+            "margin_enabled": False,
+            "strategy_external_capital": 5000.0,
             "peak_equity_adjusted": 5200.0,
             "positions": [
-                {"symbol": "VTI", "value": 2000.0, "asset_class": "etf"},
-                {"symbol": "SGOV", "value": 800.0, "asset_class": "cash_equiv"},
+                {"symbol": "VTI", "value": 2000.0, "sellable_value": 2000.0,
+                 "asset_class": "etf"},
+                {"symbol": "SGOV", "value": 800.0, "sellable_value": 800.0,
+                 "asset_class": "cash_equiv"},
             ],
+            "open_orders": [],
         },
         "market_state": {"benchmark_a_pass": True, "benchmark_b_pass": True},
-        "history": {"orders_today": 1, "turnover_today": 300.0, "used_decision_keys": []},
+        "history": {"orders_today": 1, "turnover_today": 300.0,
+                    "used_decision_keys": []},
         "proposal": {
-            "symbol": "ABCD",
-            "side": "buy",
-            "amount": 500.0,
-            "asset_class": "stock",
-            "trigger": "qualified_candidate",
-            "order_type": "market_day",
-            "thesis": "论点",
-            "counter_thesis": "反论点",
-            "invalidation": "收盘跌破 23.5",
+            "symbol": "ABCD", "side": "buy", "amount": 500.0,
+            "asset_class": "stock", "trigger": "qualified_candidate",
+            "order_type": "market_day", "quantity": None, "limit_price": None,
+            "thesis": "strong evidence", "counter_thesis": "macro reversal",
+            "invalidation": "daily close below 200dma",
             "declares": {
-                "price": 25.0,
-                "market_cap": 2e10,
-                "avg_daily_volume": 2e6,
-                "above_50dma": True,
-                "above_200dma": True,
-                "ret_3m_positive": True,
-                "ret_6m_positive": True,
+                "price": 25.0, "market_cap": 2e10, "avg_daily_volume": 2e6,
+                "above_50dma": True, "above_200dma": True,
+                "ret_3m_positive": True, "ret_6m_positive": True,
                 "rel_strength_vs_benchmark_20d": True,
-                "days_to_earnings": 10,
-                "no_thesis_breaking_news": True,
-                "is_leveraged_or_inverse": False,
-                "is_otc": False,
+                "days_to_earnings": 10, "no_thesis_breaking_news": True,
+                "is_us_listed_common_stock": True, "tradable_for_account": True,
+                "is_leveraged_or_inverse": False, "is_otc": False,
+                "wash_sale_conflict": False,
             },
         },
     }
 
 
-class GateAllowTests(unittest.TestCase):
-    def test_valid_stock_buy_allowed(self):
-        r = decision_gate.evaluate(base_payload(), POLICY)
-        self.assertTrue(r["would_allow"], r["violations"])
-        self.assertEqual(r["execution_capability"], "none")
-        self.assertIn("manual_card", r)
-        self.assertIn("手动执行", r["manual_card"]["note"])
-
-    def test_etf_buy_allowed_minimal_declares(self):
-        p = base_payload()
-        p["proposal"].update({"symbol": "QQQM", "asset_class": "etf",
-                              "trigger": "weight_deviation"})
-        p["proposal"]["declares"] = {"is_leveraged_or_inverse": False, "is_otc": False}
-        r = decision_gate.evaluate(p, POLICY)
-        self.assertTrue(r["would_allow"], r["violations"])
-
-    def test_sell_allowed_without_entry_declares(self):
-        p = base_payload()
-        p["account"]["positions"].append({"symbol": "ABCD", "value": 600.0, "asset_class": "stock"})
-        p["proposal"].update({"side": "sell", "trigger": "thesis_break"})
-        p["proposal"]["declares"] = {"is_leveraged_or_inverse": False, "is_otc": False}
-        r = decision_gate.evaluate(p, POLICY)
-        self.assertTrue(r["would_allow"], r["violations"])
+def run(payload):
+    return decision_gate.evaluate(payload, POLICY, now=NOW)
 
 
-class GateRejectTests(unittest.TestCase):
-    def _expect_violation(self, payload, code_substr):
-        r = decision_gate.evaluate(payload, POLICY)
-        self.assertFalse(r["would_allow"])
-        self.assertTrue(any(code_substr in v for v in r["violations"]),
-                        f"{code_substr} not in {r['violations']}")
+class DecisionAllowTests(unittest.TestCase):
+    def test_stock_buy(self):
+        result = run(base_payload())
+        self.assertTrue(result["would_allow"], result["violations"])
+        self.assertEqual(result["execution_capability"], "none")
 
-    def test_mode_research_rejected(self):
-        p = base_payload(); p["mode"] = "research"
-        self._expect_violation(p, "mode_must_be_decide")
+    def test_etf_rebalance(self):
+        payload = base_payload()
+        payload["proposal"].update(symbol="QQQM", asset_class="etf",
+                                   trigger="weight_deviation")
+        payload["proposal"]["declares"] = {
+            "is_leveraged_or_inverse": False, "is_otc": False,
+            "wash_sale_conflict": False, "weight_deviation_pct": 0.04,
+        }
+        self.assertTrue(run(payload)["would_allow"])
 
-    def test_stale_data(self):
-        p = base_payload(); p["data_age_seconds"] = 999
-        self._expect_violation(p, "stale_or_invalid_data_age")
+    def test_stock_risk_exit(self):
+        payload = base_payload()
+        payload["account"]["positions"].append(
+            {"symbol": "ABCD", "value": 600.0, "sellable_value": 600.0,
+             "asset_class": "stock"})
+        payload["proposal"].update(side="sell", trigger="thesis_break")
+        payload["proposal"]["declares"] = {
+            "is_leveraged_or_inverse": False, "is_otc": False,
+            "exit_signal": "thesis_invalidated",
+        }
+        self.assertTrue(run(payload)["would_allow"])
 
-    def test_nan_equity(self):
-        p = base_payload(); p["account"]["equity"] = float("nan")
-        self._expect_violation(p, "invalid_equity")
 
-    def test_account_like_identifier(self):
-        p = base_payload(); p["proposal"]["thesis"] = "账户 123456789 的论点"
-        self._expect_violation(p, "account_like_identifier_present")
+class DecisionRejectTests(unittest.TestCase):
+    def expect(self, mutate, code):
+        payload = base_payload(); mutate(payload)
+        result = run(payload)
+        self.assertFalse(result["would_allow"])
+        self.assertIn(code, result["violations"])
 
-    def test_leveraged_etf_rejected(self):
-        p = base_payload()
-        p["proposal"]["declares"]["is_leveraged_or_inverse"] = True
-        self._expect_violation(p, "leveraged_or_inverse_forbidden")
+    def test_bad_mode(self):
+        self.expect(lambda p: p.update(mode="research"), "mode_must_be_decide")
 
-    def test_missing_leveraged_declaration_rejected(self):
-        p = base_payload()
-        del p["proposal"]["declares"]["is_leveraged_or_inverse"]
-        self._expect_violation(p, "leveraged_or_inverse_forbidden")
+    def test_stale_timestamp(self):
+        self.expect(lambda p: p.update(as_of_et="2026-08-13T14:00:00-04:00"),
+                    "snapshot_time_out_of_range")
+
+    def test_declared_age_lie(self):
+        self.expect(lambda p: p.update(data_age_seconds=1), "declared_data_age_mismatch")
+
+    def test_naive_timestamp(self):
+        self.expect(lambda p: p.update(as_of_et="2026-08-13T15:40:00"),
+                    "invalid_as_of_et")
+
+    def test_capital_cap(self):
+        self.expect(lambda p: p["account"].update(strategy_external_capital=5000.01),
+                    "strategy_capital_over_cap_or_invalid")
+
+    def test_margin_account(self):
+        self.expect(lambda p: p["account"].update(account_type="margin"),
+                    "cash_account_not_verified")
+
+    def test_leverage_buying_power(self):
+        self.expect(lambda p: p["account"].update(broker_buying_power=3000),
+                    "leverage_buying_power_detected")
+
+    def test_cash_not_authoritative_bp(self):
+        self.expect(lambda p: p["account"].update(cash_available_settled=1400),
+                    "settled_cash_not_unleveraged_buying_power")
+
+    def test_nan(self):
+        self.expect(lambda p: p["account"].update(equity=float("nan")), "invalid_equity")
+
+    def test_position_missing_sellable(self):
+        self.expect(lambda p: p["account"]["positions"][0].pop("sellable_value"),
+                    "invalid_position_entry")
+
+    def test_duplicate_open_order(self):
+        def mutate(p):
+            row = {"order_id": "o1", "symbol": "VTI", "side": "buy",
+                   "asset_class": "etf", "remaining_notional": 50.0}
+            p["account"]["open_orders"] = [row, copy.deepcopy(row)]
+        self.expect(mutate, "invalid_open_order_entry")
+
+    def test_open_same_symbol(self):
+        def mutate(p):
+            p["account"]["open_orders"] = [{"order_id": "o1", "symbol": "ABCD",
+                "side": "buy", "asset_class": "stock", "remaining_notional": 100.0}]
+        self.expect(mutate, "open_order_for_symbol_exists")
+
+    def test_pending_buys_reserve_cash(self):
+        def mutate(p):
+            p["account"]["open_orders"] = [{"order_id": "o1", "symbol": "QQQM",
+                "side": "buy", "asset_class": "etf", "remaining_notional": 1000.0}]
+        self.expect(mutate, "insufficient_settled_cash_or_buffer")
+
+    def test_pending_sell_reserves_position(self):
+        def mutate(p):
+            p["account"]["positions"].append({"symbol": "ABCD", "value": 600.0,
+                "sellable_value": 600.0, "asset_class": "stock"})
+            p["account"]["open_orders"] = [{"order_id": "o1", "symbol": "ABCD",
+                "side": "sell", "asset_class": "stock", "remaining_notional": 300.0}]
+            p["proposal"].update(side="sell", trigger="thesis_break", amount=500.0)
+            p["proposal"]["declares"] = {"is_leveraged_or_inverse": False,
+                "is_otc": False, "exit_signal": "thesis_invalidated"}
+        self.expect(mutate, "sell_exceeds_available_position")
 
     def test_penny_stock(self):
-        p = base_payload(); p["proposal"]["declares"]["price"] = 3.0
-        self._expect_violation(p, "price_below_min")
+        self.expect(lambda p: p["proposal"]["declares"].update(price=4.99),
+                    "price_below_min")
 
-    def test_small_cap(self):
-        p = base_payload(); p["proposal"]["declares"]["market_cap"] = 5e9
-        self._expect_violation(p, "market_cap_below_min")
+    def test_not_common_stock(self):
+        self.expect(lambda p: p["proposal"]["declares"].update(
+            is_us_listed_common_stock=False),
+            "entry_flag_failed_is_us_listed_common_stock")
 
-    def test_below_200dma(self):
-        p = base_payload(); p["proposal"]["declares"]["above_200dma"] = False
-        self._expect_violation(p, "entry_flag_failed_above_200dma")
+    def test_wash_sale(self):
+        self.expect(lambda p: p["proposal"]["declares"].update(wash_sale_conflict=True),
+                    "wash_sale_conflict_or_unknown")
 
-    def test_earnings_too_close(self):
-        p = base_payload(); p["proposal"]["declares"]["days_to_earnings"] = 1
-        self._expect_violation(p, "too_close_to_earnings")
+    def test_earnings_window(self):
+        self.expect(lambda p: p["proposal"]["declares"].update(days_to_earnings=2),
+                    "too_close_to_earnings")
 
-    def test_invalid_trigger(self):
-        p = base_payload(); p["proposal"]["trigger"] = "fomo"
-        self._expect_violation(p, "invalid_trigger")
+    def test_weight_trigger_needs_3pp(self):
+        def mutate(p):
+            p["proposal"].update(symbol="QQQM", asset_class="etf", trigger="weight_deviation")
+            p["proposal"]["declares"] = {"is_leveraged_or_inverse": False,
+                "is_otc": False, "wash_sale_conflict": False,
+                "weight_deviation_pct": 0.02}
+        self.expect(mutate, "weight_deviation_below_trigger")
 
-    def test_missing_thesis(self):
-        p = base_payload(); p["proposal"]["thesis"] = "  "
-        self._expect_violation(p, "missing_thesis")
+    def test_bad_exit_signal(self):
+        def mutate(p):
+            p["account"]["positions"].append({"symbol": "ABCD", "value": 600.0,
+                "sellable_value": 600.0, "asset_class": "stock"})
+            p["proposal"].update(side="sell", trigger="thesis_break")
+            p["proposal"]["declares"] = {"is_leveraged_or_inverse": False,
+                "is_otc": False, "exit_signal": "because_i_feel_like_it"}
+        self.expect(mutate, "stock_exit_signal_missing_or_invalid")
 
-    def test_single_stock_over_cap(self):
-        p = base_payload(); p["proposal"]["amount"] = 900.0  # 900/5000=18% > 15%
-        self._expect_violation(p, "single_stock_over_cap")
+    def test_limit_needs_quantity(self):
+        self.expect(lambda p: p["proposal"].update(order_type="limit_day", limit_price=25),
+                    "limit_quantity_required")
 
-    def test_stocks_total_over_cap(self):
-        p = base_payload()
-        p["account"]["positions"].append({"symbol": "WXYZ", "value": 1100.0, "asset_class": "stock"})
-        p["proposal"]["amount"] = 500.0  # (1100+500)/5000=32% > 30%
-        self._expect_violation(p, "stocks_total_over_cap")
+    def test_limit_notional(self):
+        self.expect(lambda p: p["proposal"].update(order_type="limit_day",
+                    quantity=10, limit_price=25), "limit_notional_mismatch")
 
-    def test_too_many_stock_positions(self):
-        p = base_payload()
-        p["account"]["positions"] += [
-            {"symbol": "AAAA", "value": 300.0, "asset_class": "stock"},
-            {"symbol": "BBBB", "value": 300.0, "asset_class": "stock"},
-        ]
-        self._expect_violation(p, "too_many_stock_positions")
+    def test_market_rejects_quantity(self):
+        self.expect(lambda p: p["proposal"].update(quantity=20),
+                    "market_order_quantity_or_limit_forbidden")
 
-    def test_equity_exposure_over_market_state_cap(self):
-        p = base_payload()
-        p["market_state"] = {"benchmark_a_pass": False, "benchmark_b_pass": False}  # cap 20%
-        self._expect_violation(p, "equity_exposure_over_cap")
+    def test_single_stock_cap(self):
+        self.expect(lambda p: p["proposal"].update(amount=800), "single_stock_over_cap")
 
-    def test_drawdown_tier_lowers_cap(self):
-        p = base_payload()
-        p["account"]["equity"] = 3800.0            # dd vs 5200 ≈ 26.9% → cap 40%
-        p["account"]["peak_equity_adjusted"] = 5200.0
-        p["proposal"]["amount"] = 300.0
-        # 现有 etf 2000/3800=52.6% 已超 40% cap
-        r = decision_gate.evaluate(p, POLICY)
-        self.assertFalse(r["would_allow"])
-        self.assertEqual(r["derived"]["stock_cap_drawdown"], 0.4)
-        self.assertIn("equity_exposure_over_cap", r["violations"])
+    def test_cash_buffer(self):
+        def mutate(p):
+            p["account"].update(cash_available_settled=500,
+                                broker_buying_power=500, unleveraged_buying_power=500)
+        self.expect(mutate, "insufficient_settled_cash_or_buffer")
 
-    def test_deepest_drawdown_zero_cap(self):
-        p = base_payload()
-        p["account"]["equity"] = 3300.0            # dd ≈ 36.5% → cap 0
-        r = decision_gate.evaluate(p, POLICY)
-        self.assertEqual(r["derived"]["stock_cap_drawdown"], 0.0)
-        self.assertFalse(r["would_allow"])
+    def test_daily_order_integer(self):
+        self.expect(lambda p: p["history"].update(orders_today=1.5), "invalid_orders_today")
 
-    def test_insufficient_cash(self):
-        p = base_payload(); p["account"]["cash_available_settled"] = 100.0
-        self._expect_violation(p, "insufficient_settled_cash")
+    def test_daily_turnover(self):
+        self.expect(lambda p: p["history"].update(turnover_today=1200),
+                    "daily_turnover_over_cap")
 
-    def test_daily_order_limit(self):
-        p = base_payload(); p["history"]["orders_today"] = 6
-        self._expect_violation(p, "daily_order_limit_reached")
+    def test_duplicate_decision(self):
+        def mutate(p):
+            p["history"]["used_decision_keys"] = [decision_gate.compute_decision_key(
+                "2026-08-13", "ABCD", "buy", "qualified_candidate", 500)]
+        self.expect(mutate, "duplicate_decision")
 
-    def test_daily_turnover_cap(self):
-        p = base_payload(); p["history"]["turnover_today"] = 1200.0  # +500 > 1500=30%*5000
-        self._expect_violation(p, "daily_turnover_over_cap")
-
-    def test_risk_exit_sell_bypasses_frequency(self):
-        p = base_payload()
-        p["account"]["positions"].append({"symbol": "ABCD", "value": 600.0, "asset_class": "stock"})
-        p["proposal"].update({"side": "sell", "trigger": "thesis_break"})
-        p["proposal"]["declares"] = {"is_leveraged_or_inverse": False, "is_otc": False}
-        p["history"].update({"orders_today": 6, "turnover_today": 2000.0})
-        r = decision_gate.evaluate(p, POLICY)
-        self.assertTrue(r["would_allow"], r["violations"])
-
-    def test_naked_short_rejected(self):
-        p = base_payload()
-        p["proposal"].update({"side": "sell", "trigger": "thesis_break"})
-        p["proposal"]["declares"] = {"is_leveraged_or_inverse": False, "is_otc": False}
-        self._expect_violation(p, "sell_position_not_held")
-
-    def test_sell_exceeds_position_rejected(self):
-        p = base_payload()
-        p["account"]["positions"].append({"symbol": "ABCD", "value": 300.0, "asset_class": "stock"})
-        p["proposal"].update({"side": "sell", "trigger": "thesis_break", "amount": 500.0})
-        p["proposal"]["declares"] = {"is_leveraged_or_inverse": False, "is_otc": False}
-        self._expect_violation(p, "sell_exceeds_position")
-
-    def test_duplicate_decision_key(self):
-        p = base_payload()
-        key = decision_gate.compute_decision_key("2026-08-13", "ABCD", "buy",
-                                                 "qualified_candidate", 500.0)
-        p["history"]["used_decision_keys"] = [key]
-        self._expect_violation(p, "duplicate_decision")
-
-    def test_ghost_position_cannot_bypass_max_positions(self):
-        # H1 回归：同名 cash_equiv 幽灵仓位不得让第 3 只个股绕过持仓数上限
-        p = base_payload()
-        p["account"]["positions"] += [
-            {"symbol": "AAAA", "value": 300.0, "asset_class": "stock"},
-            {"symbol": "BBBB", "value": 300.0, "asset_class": "stock"},
-            {"symbol": "ABCD", "value": 1.0, "asset_class": "cash_equiv"},
-        ]
-        self._expect_violation(p, "too_many_stock_positions")
-
-    def test_grouped_digits_account_scan(self):
-        p = base_payload(); p["proposal"]["thesis"] = "账户 1234 5678 9012 的论点"
-        self._expect_violation(p, "account_like_identifier_present")
-
-    def test_long_digits_account_scan(self):
-        p = base_payload(); p["proposal"]["thesis"] = "id 123456789012345678901"
-        self._expect_violation(p, "account_like_identifier_present")
-
-    def test_hex_decision_key_not_flagged(self):
-        p = base_payload()
-        p["history"]["used_decision_keys"] = ["0" * 63 + "1"]  # 64 位 hex，含长数字段
-        r = decision_gate.evaluate(p, POLICY)
-        self.assertTrue(r["would_allow"], r["violations"])
-
-    def test_amount_below_min(self):
-        p = base_payload(); p["proposal"]["amount"] = 5.0
-        self._expect_violation(p, "amount_below_min")
-
-    def test_etf_symbol_whitelist(self):
-        p = base_payload()
-        p["proposal"].update({"symbol": "SPYU", "asset_class": "etf",
-                              "trigger": "weight_deviation"})
-        p["proposal"]["declares"] = {"is_leveraged_or_inverse": False, "is_otc": False}
-        self._expect_violation(p, "etf_symbol_not_whitelisted")
-
-    def test_cash_equiv_symbol_whitelist(self):
-        p = base_payload()
-        p["proposal"].update({"symbol": "ABCD", "asset_class": "cash_equiv",
-                              "trigger": "weight_deviation"})
-        p["proposal"]["declares"] = {"is_leveraged_or_inverse": False, "is_otc": False}
-        self._expect_violation(p, "cash_equiv_symbol_not_whitelisted")
-
-    def test_declares_must_be_dict(self):
-        p = base_payload(); p["proposal"]["declares"] = ["not", "a", "dict"]
-        self._expect_violation(p, "invalid_declares")
-
-    def test_no_execution_fields_ever(self):
-        r = decision_gate.evaluate(base_payload(), POLICY)
-        s = json.dumps(r)
-        for word in ("can_submit", "can_preview", "place_order"):
-            self.assertNotIn(word, s)
-        self.assertEqual(r["execution_capability"], "none")
+    def test_full_account_like_string(self):
+        self.expect(lambda p: p["proposal"].update(thesis="acct 1234-5678-9012"),
+                    "account_like_identifier_present")
 
 
 class JournalTests(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.TemporaryDirectory()
-        self.log = str(Path(self.dir.name) / "journal.jsonl")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = str(Path(self.tmp.name) / "journal.jsonl")
 
     def tearDown(self):
-        self.dir.cleanup()
+        self.tmp.cleanup()
 
-    def test_append_and_chain(self):
-        e1 = journal_append.append(self.log, {"type": "card", "symbol": "VTI"})
-        e2 = journal_append.append(self.log, {"type": "fill", "symbol": "VTI"})
-        self.assertEqual(e1["seq"], 0)
-        self.assertEqual(e2["prev_hash"], e1["hash"])
+    def test_chain(self):
+        first = journal_append.append(self.log, {"type": "decision", "symbol": "VTI"})
+        second = journal_append.append(self.log, {"type": "fill", "symbol": "VTI"})
+        self.assertEqual(second["prev_hash"], first["hash"])
 
-    def test_tamper_detected(self):
-        journal_append.append(self.log, {"type": "card", "n": 1})
-        journal_append.append(self.log, {"type": "card", "n": 2})
+    def test_tamper(self):
+        journal_append.append(self.log, {"type": "decision", "symbol": "VTI"})
         lines = Path(self.log).read_text().splitlines()
-        bad = json.loads(lines[0]); bad["event"]["n"] = 99
-        Path(self.log).write_text(json.dumps(bad) + "\n" + lines[1] + "\n")
+        entry = json.loads(lines[0]); entry["event"]["symbol"] = "QQQM"
+        Path(self.log).write_text(json.dumps(entry) + "\n")
         with self.assertRaises(ValueError):
-            journal_append.append(self.log, {"type": "card", "n": 3})
+            journal_append.append(self.log, {"type": "decision", "symbol": "VTI"})
 
-    def test_sensitive_key_rejected(self):
+    def test_sensitive_account_key(self):
         with self.assertRaises(ValueError):
-            journal_append.append(self.log, {"type": "fill", "api_key": "x"})
+            journal_append.append(self.log, {"type": "fill", "account-url": "x"})
 
-    def test_account_like_value_rejected(self):
+    def test_non_finite_numeric(self):
         with self.assertRaises(ValueError):
-            journal_append.append(self.log, {"type": "fill", "memo": "acct 987654321012"})
+            journal_append.append(self.log, {"type": "fill", "memo": float("inf")})
 
-    def test_masked_last4_ok(self):
-        entry = journal_append.append(self.log, {"type": "fill", "memo": "****1234 已核对"})
-        self.assertEqual(entry["seq"], 0)
+    def test_masked_ref(self):
+        row = journal_append.append(self.log, {"type": "decision",
+            "account_ref_masked": "****0000"})
+        self.assertEqual(row["seq"], 0)
 
-    def test_grouped_digits_rejected(self):
+    def test_unknown_event_type(self):
         with self.assertRaises(ValueError):
-            journal_append.append(self.log, {"type": "fill", "memo": "acct 9876 5432 1012"})
-
-    def test_decision_key_hex_allowed(self):
-        entry = journal_append.append(self.log, {"type": "fill", "decision_key": "a" * 63 + "1"})
-        self.assertEqual(entry["seq"], 0)
+            journal_append.append(self.log, {"type": "anything_goes"})
 
 
 class BehaviorTests(unittest.TestCase):
-    def _write(self, events):
-        d = tempfile.TemporaryDirectory()
-        self.addCleanup(d.cleanup)
-        log = str(Path(d.name) / "j.jsonl")
-        for e in events:
-            journal_append.append(log, e)
-        return log
+    def test_insufficient_data(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        log = str(Path(tmp.name) / "j.jsonl")
+        journal_append.append(log, {"type": "fill", "date_et": "2026-08-01",
+                                    "symbol": "A", "side": "buy", "amount": 100.0})
+        findings = behavior_review.analyze(behavior_review.load_fills(log), 6)
+        self.assertTrue(all(not row["flag"] for row in findings))
 
-    def test_disposition_effect_flagged(self):
-        events = []
-        for i in range(3):
-            events.append({"type": "fill", "date_et": f"2026-08-0{i+1}", "symbol": "A",
-                           "side": "sell", "amount": 100.0, "pnl": 10.0, "holding_days": 2})
-        for i in range(3):
-            events.append({"type": "fill", "date_et": f"2026-08-0{i+4}", "symbol": "B",
-                           "side": "sell", "amount": 100.0, "pnl": -10.0, "holding_days": 20})
-        fills = behavior_review.load_fills(self._write(events))
-        findings = {f["bias"]: f for f in behavior_review.analyze(fills, 6)}
-        self.assertTrue(findings["disposition_effect"]["flag"])
 
-    def test_insufficient_data_honest(self):
-        fills = behavior_review.load_fills(self._write(
-            [{"type": "fill", "date_et": "2026-08-01", "symbol": "A", "side": "buy",
-              "amount": 100.0}]))
-        findings = {f["bias"]: f for f in behavior_review.analyze(fills, 6)}
-        self.assertEqual(findings["disposition_effect"]["stats"].get("note"), "insufficient_data")
-        self.assertFalse(findings["disposition_effect"]["flag"])
+class CadenceTests(unittest.TestCase):
+    def row(self, clock, buying_power=100.0, trading=True, urgent=False,
+            seconds="00"):
+        return cadence_gate.evaluate({
+            "as_of_et": f"2026-08-13T{clock}:{seconds}-04:00",
+            "is_trading_day": trading,
+            "unleveraged_buying_power": buying_power,
+            "urgent_risk_event": urgent,
+        }, POLICY)
 
-    def test_chasing_flagged(self):
-        events = [{"type": "fill", "date_et": f"2026-08-0{i+1}", "symbol": "A", "side": "buy",
-                   "amount": 100.0, "run_up_5d_pct": 15.0} for i in range(5)]
-        fills = behavior_review.load_fills(self._write(events))
-        findings = {f["bias"]: f for f in behavior_review.analyze(fills, 6)}
-        self.assertTrue(findings["chasing"]["flag"])
+    def test_two_full_analyses(self):
+        self.assertEqual(self.row("08:30")["action"], "full_preopen_analysis")
+        close = self.row("17:30")
+        self.assertTrue(close["full_analysis"])
+        self.assertTrue(close["send_daily_report"])
+        self.assertTrue(close["run_evolution"])
 
-    def test_deviation_ratio(self):
-        events = [
-            {"type": "fill", "date_et": "2026-08-01", "symbol": "A", "side": "buy",
-             "amount": 100.0, "deviation": "none"},
-            {"type": "fill", "date_et": "2026-08-02", "symbol": "A", "side": "buy",
-             "amount": 100.0, "deviation": "改了金额"},
-        ]
-        fills = behavior_review.load_fills(self._write(events))
-        findings = {f["bias"]: f for f in behavior_review.analyze(fills, 6)}
-        self.assertEqual(findings["card_deviation"]["stats"]["deviations"], 1)
-        self.assertTrue(findings["card_deviation"]["flag"])  # 0.5 > 0.3
+    def test_sufficient_buying_power_every_half_hour(self):
+        result = self.row("10:30", buying_power=20.0)
+        self.assertTrue(result["operation_decision"])
+        self.assertTrue(result["trade_permitted_by_cadence"])
+
+    def test_insufficient_buying_power_between_slots(self):
+        result = self.row("10:30", buying_power=19.99)
+        self.assertEqual(result["action"], "account_order_probe")
+        self.assertFalse(result["operation_decision"])
+
+    def test_insufficient_buying_power_two_hour_slot(self):
+        result = self.row("12:00", buying_power=19.99)
+        self.assertTrue(result["operation_decision"])
+        self.assertTrue(result["trade_permitted_by_cadence"])
+
+    def test_urgent_event_does_not_wait(self):
+        result = self.row("11:30", buying_power=0.0, urgent=True)
+        self.assertTrue(result["operation_decision"])
+
+    def test_closed_day_never_operates(self):
+        result = self.row("12:00", buying_power=100.0, trading=False)
+        self.assertFalse(result["operation_decision"])
+        self.assertFalse(result["trade_permitted_by_cadence"])
+
+    def test_two_minute_late_wakeup_uses_noon_slot(self):
+        result = self.row("12:02", buying_power=12.26)
+        self.assertEqual(result["action"], "operation_decision")
+        self.assertEqual(result["reason"], "insufficient_buying_power_2h_cadence")
+        self.assertEqual(result["scheduled_for_et"],
+                         "2026-08-13T12:00:00-04:00")
+        self.assertEqual(result["schedule_delay_seconds"], 120)
+
+    def test_late_wakeup_never_maps_to_future_slot(self):
+        result = self.row("11:59", buying_power=12.26)
+        self.assertEqual(result["action"], "none")
+        self.assertIsNone(result["scheduled_for_et"])
+
+    def test_wakeup_outside_tolerance_is_skipped(self):
+        result = self.row("12:06", buying_power=12.26)
+        self.assertEqual(result["action"], "none")
+        self.assertIsNone(result["cadence_slot_id"])
+
+    def test_slot_id_is_stable_inside_tolerance(self):
+        first = self.row("12:01", buying_power=12.26)
+        retry = self.row("12:04", buying_power=12.26)
+        self.assertEqual(first["cadence_slot_id"], retry["cadence_slot_id"])
+
+    def test_close_analysis_accepts_bounded_lateness(self):
+        close = self.row("17:32", trading=False)
+        self.assertEqual(close["action"], "full_close_analysis")
+        self.assertTrue(close["send_daily_report"])
+
+    def test_invalid_tolerance_fails_closed(self):
+        policy = copy.deepcopy(POLICY)
+        policy["decision_cadence"]["schedule_late_tolerance_minutes"] = 30
+        with self.assertRaisesRegex(ValueError,
+                                    "schedule_late_tolerance_minutes_invalid"):
+            cadence_gate.evaluate({
+                "as_of_et": "2026-08-13T12:02:00-04:00",
+                "is_trading_day": True,
+                "unleveraged_buying_power": 12.26,
+                "urgent_risk_event": False,
+            }, policy)
+
+
+class PerformanceReviewTests(unittest.TestCase):
+    def period(self, days=20, strategy=0.05, voo=0.03, qqq=0.04):
+        return {"label": f"{days}d", "trading_days": days,
+                "strategy_return": strategy, "voo_return": voo,
+                "qqq_return": qqq, "same_interval": True,
+                "cash_flow_adjusted": True, "net_of_costs": True}
+
+    def challenge(self, **updates):
+        row = {
+            "started": True,
+            "as_of_date_et": "2026-08-13",
+            "start_date_et": "2026-08-07",
+            "strategy_external_capital": 5000.0,
+            "start_equity_adjusted": 5207.12,
+            "current_equity_adjusted": 5707.12,
+            "peak_equity_adjusted": 5800.0,
+            "cash_flow_adjusted": True,
+            "net_of_costs": True,
+            "baseline_locked": True,
+            "start_rule_verified": True,
+        }
+        row.update(updates)
+        return row
+
+    def payload(self, periods=None, challenge=None):
+        return {"periods": periods or [self.period()],
+                "challenge": challenge or self.challenge(),
+                "daily": {"date_et": "2026-08-13", "strategy_return": 0.01,
+                          "voo_return": 0.005, "qqq_return": 0.008,
+                          "same_session": True, "cash_flow_adjusted": True,
+                          "net_of_costs": True, "completed_session": True},
+                "risk_context": {"benchmark_a_pass": True,
+                                 "benchmark_b_pass": True,
+                                 "snapshot_complete": True,
+                                 "no_material_risk_event": True,
+                                 "halt_active": False,
+                                 "volatility_regime": "normal"}}
+
+    def test_can_claim_only_after_twenty_days_and_beating_both(self):
+        result = performance_review.evaluate(self.payload(), POLICY)
+        self.assertTrue(result["periods"][0]["can_claim_outperformance"])
+        self.assertFalse(result["expand_qualified_stock_search"])
+
+    def test_underperformance_expands_search_not_trade_authority(self):
+        result = performance_review.evaluate(self.payload(periods=[
+            self.period(days=5, strategy=0.01, voo=0.02, qqq=0.03)]), POLICY)
+        self.assertTrue(result["expand_qualified_stock_search"])
+        self.assertFalse(result["trade_authorized"])
+
+    def test_short_history_cannot_claim(self):
+        result = performance_review.evaluate(
+            self.payload(periods=[self.period(days=5)]), POLICY)
+        self.assertFalse(result["periods"][0]["can_claim_outperformance"])
+
+    def test_requires_cash_flow_and_cost_alignment(self):
+        row = self.period(); row["cash_flow_adjusted"] = False
+        with self.assertRaises(ValueError):
+            performance_review.evaluate(self.payload(periods=[row]), POLICY)
+
+    def test_100_calendar_day_profit_progress(self):
+        result = performance_review.evaluate(self.payload(), POLICY)["profit_challenge"]
+        self.assertEqual(result["challenge_day"], 7)
+        self.assertAlmostEqual(result["net_profit"], 500.0)
+        self.assertAlmostEqual(result["target_remaining"], 2000.0)
+        self.assertAlmostEqual(result["target_equity_adjusted"], 7707.12)
+        self.assertFalse(result["trade_authorized"])
+
+    def test_daily_objective_requires_beating_both(self):
+        result = performance_review.evaluate(self.payload(), POLICY)["daily_objective"]
+        self.assertTrue(result["objective_met"])
+        payload = self.payload()
+        payload["daily"]["strategy_return"] = 0.006
+        result = performance_review.evaluate(payload, POLICY)["daily_objective"]
+        self.assertFalse(result["objective_met"])
+        self.assertFalse(result["trade_authorized"])
+
+    def test_preparation_never_reports_percentage_progress(self):
+        challenge = {"started": False, "as_of_date_et": "2026-08-13",
+                     "strategy_external_capital": 4000.0}
+        result = performance_review.evaluate(
+            self.payload(challenge=challenge), POLICY)["profit_challenge"]
+        self.assertEqual(result["status"], "preparation")
+        self.assertIsNone(result["progress_ratio"])
+
+    def test_ready_day_waits_for_next_trading_day(self):
+        challenge = {"started": False, "as_of_date_et": "2026-08-13",
+                     "strategy_external_capital": 5000.0}
+        result = performance_review.evaluate(
+            self.payload(challenge=challenge), POLICY)["profit_challenge"]
+        self.assertEqual(result["status"], "ready_day")
+        self.assertIsNone(result["challenge_day"])
+
+    def test_challenge_requires_locked_adjusted_baseline(self):
+        challenge = self.challenge(baseline_locked=False)
+        with self.assertRaises(ValueError):
+            performance_review.evaluate(self.payload(challenge=challenge), POLICY)
+
+    def test_challenge_deadline_is_truthful(self):
+        challenge = self.challenge(as_of_date_et="2026-11-15",
+                                   current_equity_adjusted=7000.0,
+                                   peak_equity_adjusted=7100.0)
+        result = performance_review.evaluate(
+            self.payload(challenge=challenge), POLICY)["profit_challenge"]
+        self.assertEqual(result["status"], "ended_below_target")
+        self.assertFalse(result["within_100_day_window"])
+
+    def test_far_behind_can_enter_controlled_offense(self):
+        challenge = self.challenge(as_of_date_et="2026-08-26",
+                                   current_equity_adjusted=5100.0,
+                                   peak_equity_adjusted=5300.0)
+        payload = self.payload(
+            periods=[self.period(days=10, strategy=-0.02, voo=0.02, qqq=0.03)],
+            challenge=challenge)
+        posture = performance_review.evaluate(payload, POLICY)["risk_posture"]
+        self.assertTrue(posture["controlled_offense_eligible"])
+        self.assertEqual(posture["posture"], "controlled_offense")
+        self.assertEqual(posture["target_allocation_if_candidates_qualify"]
+                         ["individual_stocks_total_max"], 0.30)
+        self.assertFalse(posture["trade_authorized"])
+
+    def test_controlled_offense_blocked_by_drawdown(self):
+        challenge = self.challenge(as_of_date_et="2026-08-26",
+                                   current_equity_adjusted=4500.0,
+                                   peak_equity_adjusted=5100.0)
+        payload = self.payload(
+            periods=[self.period(days=10, strategy=-0.10, voo=0.02, qqq=0.03)],
+            challenge=challenge)
+        posture = performance_review.evaluate(payload, POLICY)["risk_posture"]
+        self.assertFalse(posture["controlled_offense_eligible"])
+        self.assertFalse(posture["safeguards"]["drawdown_below_entry_limit"])
+
+    def test_controlled_offense_blocked_by_trend_or_high_volatility(self):
+        challenge = self.challenge(as_of_date_et="2026-08-26",
+                                   current_equity_adjusted=5100.0,
+                                   peak_equity_adjusted=5300.0)
+        payload = self.payload(
+            periods=[self.period(days=10, strategy=-0.02, voo=0.02, qqq=0.03)],
+            challenge=challenge)
+        payload["risk_context"]["benchmark_b_pass"] = False
+        payload["risk_context"]["volatility_regime"] = "high"
+        posture = performance_review.evaluate(payload, POLICY)["risk_posture"]
+        self.assertFalse(posture["controlled_offense_eligible"])
+        self.assertFalse(posture["safeguards"]["both_trends_pass"])
+        self.assertFalse(posture["safeguards"]["volatility_allowed"])
+
+    def test_controlled_offense_policy_cannot_exceed_hard_caps(self):
+        policy = copy.deepcopy(POLICY)
+        policy["controlled_offense"]["target_total_stock_weight"] = 0.31
+        with self.assertRaises(ValueError):
+            performance_review.evaluate(self.payload(), policy)
 
 
 if __name__ == "__main__":

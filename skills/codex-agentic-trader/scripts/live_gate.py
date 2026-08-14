@@ -1,40 +1,46 @@
 #!/usr/bin/env python3
-"""实盘两阶段确定性闸门（codex-agentic-trader）。
+"""Robinhood 自动交易确定性闸门。
 
 在 decision_gate 全量基础检查之上扩展：
-- mandate 授权推导模式（live/shadow），会话无权声明模式；到期日真实日历解析；
 - HALT 哨兵：存在时只放行风险退出卖单，其余全拒；halt_required 时闸门自写 HALT（自锁）；
-- 本地 intent 与券商订单对账（含重复 client_key 冲突检测），不平拒新单；
-- 两阶段：pre_preview → post_preview；preview 回执必须与提案逐字段绑定且一次性消费；
-- 闸门本地状态账本（gate_state_file）：当日已批订单数/金额/decision_key/preview_id 由闸门
+- 本地 intent 与券商订单按 Robinhood order_id 对账，不平拒新单；
+- 两阶段：pre_review → post_review；验证 Robinhood review_equity_order 真实回执；
+- 闸门本地状态账本（gate_state_file）：当日已批审核数/金额/decision_key/review_fingerprint 由闸门
   自己记账，与调用方声明取更严——频次/换手/幂等不再单信调用方（对抗审查 P2 修复）；
-- limit_day 单必须携带限价；approved_intent 与 preview_id/decision_key/报价绑定锁单。
+- limit_day 单必须携带数量与限价；approved_intent 与 review_fingerprint/decision_key 绑定。
 
-本脚本只输出判定与批准的 intent，自身没有任何券商调用能力。一切异常 fail-closed。
+用户已对 policy 边界内的合规订单给出持续授权。post_review 在回执洁净、
+数据新鲜、对账完整且无平台实质性警告时可输出 can_submit=true。
+若 Robinhood 要求额外平台确认、披露确认或返回实质性警告，必须停止，不得绕过。
 """
 import argparse
 import fcntl
 import hashlib
 import json
 import math
-import subprocess
 import sys
-from datetime import date
+import uuid
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 POLICY_PATH = SCRIPT_DIR.parent / "policy" / "policy.json"
+TOOLSET_PATH = SCRIPT_DIR.parent / "policy" / "enabled_tools_live.json"
 sys.path.insert(0, str(SCRIPT_DIR))
 
-VALID_ORDER_STATUSES = {"open", "partially_filled", "filled", "cancelled", "rejected", "unknown"}
-TERMINAL_STATUSES = {"filled", "cancelled", "rejected"}
-MANDATE_CONFIRMATION_TEMPLATE = "I AUTHORIZE LIVE TRADING {last4}"
+ACTIVE_ORDER_STATUSES = {"new", "queued", "confirmed", "unconfirmed", "partially_filled",
+                         "pending_cancelled", "locating"}
+TERMINAL_ORDER_STATUSES = {"filled", "cancelled", "rejected", "failed", "voided",
+                           "partially_filled_rest_cancelled", "locate_failed"}
+VALID_ORDER_STATUSES = ACTIVE_ORDER_STATUSES | TERMINAL_ORDER_STATUSES | {"unknown"}
 
 
 def _fail(violations, phase="unknown"):
     print(json.dumps({
-        "mode": "shadow", "phase": phase, "would_allow": False,
-        "can_preview": False, "can_submit": False, "halt_required": False,
+        "phase": phase, "would_allow": False,
+        "can_review": False,
+        "can_submit": False, "halt_required": False,
         "violations": violations,
     }, ensure_ascii=False))
     sys.exit(1)
@@ -53,24 +59,60 @@ def _expand(p):
     return Path(p).expanduser()
 
 
-def _parse_iso_date(s):
-    """严格 ISO 日期解析；任何非规范形式返回 None（P3 修复：不再用字符串比较）。"""
-    if not isinstance(s, str) or len(s) != 10:
+def _parse_iso_datetime(s):
+    """要求带时区偏移的 ISO 8601 时间；naive 值一律拒绝。"""
+    if not isinstance(s, str):
         return None
     try:
-        return date.fromisoformat(s)
-    except ValueError:
+        value = datetime.fromisoformat(s)
+        return value if value.tzinfo is not None else None
+    except (TypeError, ValueError):
         return None
 
 
-def _keychain_checksum(service):
-    try:
-        out = subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-w"],
-            capture_output=True, text=True, timeout=10)
-        return out.stdout.strip() if out.returncode == 0 else None
-    except Exception:  # noqa: BLE001
-        return None
+def _canonical_hash(obj):
+    raw = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _now_et(policy):
+    return datetime.now(ZoneInfo(policy["market_timezone"]))
+
+
+def _minutes(hhmm):
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    return hour * 60 + minute
+
+
+def _check_execution_window(current, policy, prop, violations):
+    et = current.astimezone(ZoneInfo(policy["market_timezone"]))
+    minute = et.hour * 60 + et.minute
+    if et.weekday() >= 5:
+        violations.append("not_weekday_session")
+        return
+    if not (_minutes(policy["regular_session_start_et"])
+            <= minute <= _minutes(policy["regular_session_end_et"])):
+        violations.append("outside_regular_session")
+    is_new_stock_risk = (prop.get("side") == "buy"
+                         and prop.get("asset_class") == "stock")
+    if is_new_stock_risk and minute < _minutes(policy["new_risk_not_before_et"]):
+        violations.append("new_stock_risk_too_early")
+
+
+def _check_snapshot_coverage(account, violations):
+    coverage = account.get("coverage") if isinstance(account, dict) else None
+    required = ("positions_complete", "open_equity_orders_complete",
+                "today_equity_orders_complete", "today_fills_complete")
+    if not isinstance(coverage, dict):
+        violations.append("snapshot_coverage_missing")
+        return
+    for key in required:
+        if coverage.get(key) is not True:
+            violations.append(f"snapshot_coverage_incomplete:{key}")
+    # 高级订单工具当前不是连接器契约的必备项。字段必须忠实传布尔值，
+    # 但 false 不伪装成已覆盖，也不单独阻断普通股票/ETF 订单。
+    if not isinstance(coverage.get("advanced_orders_checked"), bool):
+        violations.append("advanced_order_coverage_invalid")
 
 
 def check_halt(policy):
@@ -81,40 +123,6 @@ def write_halt(policy):
     p = _expand(policy["halt_file"])
     p.parent.mkdir(parents=True, exist_ok=True)
     p.touch()
-
-
-def load_mandate(policy, today=None, skip_keychain=False):
-    path = _expand(policy["mandate_file"])
-    if not path.exists():
-        return None, "mandate_missing"
-    try:
-        mode = path.stat().st_mode & 0o777
-        if mode & 0o077:
-            return None, "mandate_permissions_too_open"
-        raw = path.read_text()
-        m = json.loads(raw)
-    except Exception:  # noqa: BLE001
-        return None, "mandate_unreadable"
-    if m.get("mandate_version") != "1.0":
-        return None, "mandate_version_unsupported"
-    if m.get("account_last4") != policy["account_last4"]:
-        return None, "mandate_account_mismatch"
-    expected = MANDATE_CONFIRMATION_TEMPLATE.format(last4=policy["account_last4"])
-    if m.get("confirmation") != expected:
-        return None, "mandate_confirmation_invalid"
-    today_d = _parse_iso_date(today or date.today().isoformat())
-    exp_d = _parse_iso_date(m.get("expires_at_et"))
-    if today_d is None or exp_d is None or exp_d < today_d:
-        return None, "mandate_expired"
-    for f in ("max_order_amount", "max_daily_turnover"):
-        if not _is_finite_number(m.get(f)) or m[f] <= 0:
-            return None, f"mandate_invalid_{f}"
-    if not skip_keychain:
-        stored = _keychain_checksum(policy["keychain_service"])
-        actual = hashlib.sha256(raw.encode()).hexdigest()
-        if stored is None or stored != actual:
-            return None, "mandate_checksum_mismatch"
-    return m, "ok"
 
 
 # ---------- 闸门本地状态账本（P2 修复） ----------
@@ -137,6 +145,8 @@ def load_state(path, date_et):
             return empty_state(date_et), "ok"
         for o in s["orders"]:
             if not (isinstance(o, dict) and isinstance(o.get("decision_key"), str)
+                    and isinstance(o.get("review_fingerprint"), str)
+                    and isinstance(o.get("ref_id"), str)
                     and _is_finite_number(o.get("amount"))):
                 return None, "state_corrupt"
         return s, "ok"
@@ -147,19 +157,22 @@ def load_state(path, date_et):
 def save_state(path, state):
     p = _expand(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a+") as fh:
+    import os
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "r+") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         fh.seek(0)
         fh.truncate()
         fh.write(json.dumps(state, ensure_ascii=False))
         fh.flush()
-        import os
         os.fsync(fh.fileno())
 
 
-def record_submission(state, decision_key, preview_id, amount):
+def record_submission(state, decision_key, review_fingerprint, amount, ref_id):
     state["orders"].append({"decision_key": decision_key,
-                            "preview_id": preview_id, "amount": amount})
+                            "review_fingerprint": review_fingerprint,
+                            "ref_id": ref_id, "amount": amount})
     return state
 
 
@@ -174,83 +187,152 @@ def check_reconciliation(recon, violations):
     if not isinstance(intents, list) or not isinstance(broker, list):
         violations.append("invalid_reconciliation")
         return
-    def _valid(rows):
-        for r in rows:
-            if not (isinstance(r, dict) and isinstance(r.get("client_key"), str)
-                    and r.get("client_key") and r.get("status") in VALID_ORDER_STATUSES):
-                return False
-        return True
-    if not (_valid(intents) and _valid(broker)):
+    def _valid_local(row):
+        return (isinstance(row, dict)
+                and isinstance(row.get("order_id"), str) and bool(row["order_id"])
+                and row.get("status") in VALID_ORDER_STATUSES)
+
+    def _valid_broker(row):
+        return (isinstance(row, dict)
+                and isinstance(row.get("order_id"), str) and bool(row["order_id"])
+                and isinstance(row.get("placed_agent"), str) and bool(row["placed_agent"])
+                and row.get("status") in VALID_ORDER_STATUSES)
+
+    if not all(_valid_local(r) for r in intents) or not all(_valid_broker(r) for r in broker):
         violations.append("invalid_reconciliation_entry")
         return
     broker_by_key = {}
     for r in broker:
-        k = r["client_key"]
+        k = r["order_id"]
         if k in broker_by_key and broker_by_key[k]["status"] != r["status"]:
-            # P7 修复：同 client_key 冲突状态 = 券商侧不一致
             violations.append("reconciliation_mismatch")
             return
         broker_by_key[k] = r
-    local_keys = {r["client_key"] for r in intents}
+    local_by_key = {}
     for it in intents:
+        if it["order_id"] in local_by_key and local_by_key[it["order_id"]]["status"] != it["status"]:
+            violations.append("reconciliation_mismatch")
+            return
+        local_by_key[it["order_id"]] = it
         if it["status"] == "unknown":
             violations.append("reconciliation_mismatch")
             return
-        if it["status"] not in TERMINAL_STATUSES and it["client_key"] not in broker_by_key:
+        if it["status"] in ACTIVE_ORDER_STATUSES and it["order_id"] not in broker_by_key:
             violations.append("reconciliation_mismatch")
             return
     for br in broker:
-        if br["status"] == "unknown" or br["client_key"] not in local_keys:
+        if br["status"] == "unknown":
+            violations.append("reconciliation_mismatch")
+            return
+        if br["status"] in ACTIVE_ORDER_STATUSES and br["placed_agent"] != "agentic":
+            violations.append("external_open_order_present")
+            return
+        if br["placed_agent"] == "agentic" and br["order_id"] not in local_by_key:
             violations.append("reconciliation_mismatch")
             return
 
 
-def check_preview(preview, policy, prop, used_preview_ids, violations):
-    """P1 修复：回执必须与提案逐字段绑定，且 preview_id 一次性消费。"""
-    if not isinstance(preview, dict):
-        violations.append("missing_preview")
-        return
-    if preview.get("preflight_status") != "clean":
-        violations.append("preview_not_clean")
-    if preview.get("warnings") != []:
-        violations.append("preview_has_warnings")
-    pid = preview.get("preview_id")
-    if not (isinstance(pid, str) and pid):
-        violations.append("preview_id_missing")
-    elif pid in used_preview_ids:
-        violations.append("preview_replayed")
-    age = preview.get("preview_age_seconds")
-    if not (_is_finite_number(age) and 0 <= age <= policy["max_preview_age_seconds"]):
-        violations.append("preview_stale")
-    qp = preview.get("quoted_price")
-    if not (_is_finite_number(qp) and qp > 0):
-        violations.append("preview_quoted_price_invalid")
-    # 与提案绑定：symbol/side/amount 必须逐字段一致
-    if preview.get("symbol") != prop.get("symbol") or preview.get("side") != prop.get("side"):
-        violations.append("preview_proposal_mismatch")
-    amt = preview.get("amount")
-    if not (_is_finite_number(amt) and _is_finite_number(prop.get("amount"))
-            and abs(amt - prop["amount"]) <= 0.01):
-        violations.append("preview_proposal_mismatch")
+def _decimal_string(value):
+    try:
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+    except (TypeError, ValueError):
+        return None
 
 
-def evaluate(payload, policy, today=None, skip_keychain=False, state=None):
+def _review_fingerprint(review):
+    return _canonical_hash(review)
+
+
+def check_review(review, policy, prop, used_fingerprints, violations, now=None):
+    """验证当前 Robinhood review_equity_order 的请求+响应包络。"""
+    if not isinstance(review, dict):
+        violations.append("missing_review")
+        return None
+    request = review.get("request")
+    response = review.get("response")
+    observed = _parse_iso_datetime(review.get("observed_at_et"))
+    if not isinstance(request, dict) or not isinstance(response, dict) or observed is None:
+        violations.append("invalid_review_envelope")
+        return None
+    current = now or _now_et(policy)
+    age = (current.astimezone(observed.tzinfo) - observed).total_seconds()
+    if not (-policy["max_clock_skew_seconds"] <= age <= policy["max_review_age_seconds"]):
+        violations.append("review_stale")
+
+    if request.get("market_hours") != "regular_hours" or request.get("time_in_force") != "gfd":
+        violations.append("review_session_forbidden")
+    expected_type = "market" if prop.get("order_type") == "market_day" else "limit"
+    for field, expected in (("symbol", prop.get("symbol")), ("side", prop.get("side")),
+                            ("type", expected_type)):
+        if request.get(field) != expected or response.get(field) != expected:
+            violations.append("review_proposal_mismatch")
+
+    if expected_type == "market":
+        reviewed_amount = _decimal_string(request.get("dollar_amount"))
+        echoed_amount = _decimal_string(response.get("dollar_amount"))
+        if (reviewed_amount is None or echoed_amount is None
+                or not _is_finite_number(prop.get("amount"))
+                or abs(reviewed_amount - prop["amount"]) > 0.01
+                or abs(echoed_amount - prop["amount"]) > 0.01
+                or "quantity" in request):
+            violations.append("review_proposal_mismatch")
+    else:
+        reviewed_qty = _decimal_string(request.get("quantity"))
+        echoed_qty = _decimal_string(response.get("quantity"))
+        reviewed_limit = _decimal_string(request.get("limit_price"))
+        echoed_limit = _decimal_string(response.get("limit_price"))
+        if (reviewed_qty is None or reviewed_qty <= 0 or echoed_qty != reviewed_qty
+                or reviewed_limit is None or reviewed_limit <= 0 or echoed_limit != reviewed_limit
+                or not _is_finite_number(prop.get("quantity"))
+                or abs(reviewed_qty - prop["quantity"]) > 1e-6
+                or abs(reviewed_limit - prop.get("limit_price", 0)) > 0.000001
+                or abs(reviewed_qty * reviewed_limit - prop.get("amount", 0)) > 0.01
+                or "dollar_amount" in request):
+            violations.append("review_proposal_mismatch")
+
+    if response.get("order_checks") != {}:
+        violations.append("review_has_alerts")
+    disclosure = response.get("market_data_disclosure")
+    if not (isinstance(disclosure, str) and disclosure.strip()):
+        violations.append("review_disclosure_missing")
+    quote = response.get("quote_data")
+    if not isinstance(quote, dict):
+        violations.append("review_quote_missing")
+    else:
+        bid = _decimal_string(quote.get("bid_price"))
+        ask = _decimal_string(quote.get("ask_price"))
+        if (quote.get("symbol") != prop.get("symbol") or quote.get("state") != "active"
+                or quote.get("has_traded") is not True or bid is None or ask is None
+                or bid <= 0 or ask <= 0 or ask < bid):
+            violations.append("review_quote_invalid")
+        else:
+            midpoint = (bid + ask) / 2
+            spread_bps = (ask - bid) / midpoint * 10000
+            if spread_bps > policy["max_spread_bps"]:
+                violations.append("review_spread_too_wide")
+    fingerprint = _review_fingerprint(review)
+    if fingerprint in used_fingerprints:
+        violations.append("review_replayed")
+    return fingerprint
+
+
+def evaluate(payload, policy, now=None, state=None):
     import decision_gate
 
     phase = payload.get("phase")
-    if phase not in ("pre_preview", "post_preview"):
-        return {"mode": "shadow", "phase": str(phase), "would_allow": False,
-                "can_preview": False, "can_submit": False, "halt_required": False,
+    if phase not in ("pre_review", "post_review"):
+        return {"phase": str(phase), "would_allow": False,
+                "can_review": False,
+                "can_submit": False, "halt_required": False,
                 "violations": ["invalid_phase"]}
     if "mode" in payload:
-        return {"mode": "shadow", "phase": phase, "would_allow": False,
-                "can_preview": False, "can_submit": False, "halt_required": False,
+        return {"phase": phase, "would_allow": False,
+                "can_review": False,
+                "can_submit": False, "halt_required": False,
                 "violations": ["mode_must_not_be_declared"]}
 
     halted = check_halt(policy)
-    mandate, mandate_reason = load_mandate(policy, today=today, skip_keychain=skip_keychain)
-    mode = "live" if mandate else "shadow"
-
     prop = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else {}
     is_risk_exit = (prop.get("side") == "sell"
                     and prop.get("trigger") in policy["risk_exit_triggers"])
@@ -271,11 +353,12 @@ def evaluate(payload, policy, today=None, skip_keychain=False, state=None):
     caller_keys = hist.get("used_decision_keys")
     merged_hist["used_decision_keys"] = (
         (caller_keys if isinstance(caller_keys, list) else []) + state_keys)
-    used_preview_ids = set(
-        o.get("preview_id") for o in state_orders if o.get("preview_id"))
-    caller_pids = hist.get("used_preview_ids")
-    if isinstance(caller_pids, list):
-        used_preview_ids.update(p for p in caller_pids if isinstance(p, str))
+    used_review_fingerprints = set(
+        o.get("review_fingerprint") for o in state_orders if o.get("review_fingerprint"))
+    caller_fingerprints = hist.get("used_review_fingerprints")
+    if isinstance(caller_fingerprints, list):
+        used_review_fingerprints.update(
+            p for p in caller_fingerprints if isinstance(p, str))
 
     # 基础检查复用 decision_gate
     base_payload = dict(payload)
@@ -283,13 +366,17 @@ def evaluate(payload, policy, today=None, skip_keychain=False, state=None):
     base_payload["history"] = merged_hist
     base_payload.pop("phase", None)
     recon_sub = base_payload.pop("reconciliation", None)
-    preview_sub = base_payload.pop("preview", None)
-    base = decision_gate.evaluate(base_payload, policy)
+    review_sub = base_payload.pop("review", None)
+    current = now or _now_et(policy)
+    base = decision_gate.evaluate(base_payload, policy, now=current)
     violations += list(base["violations"])
 
     # P6 修复：被 pop 的子树也要过账号泄漏扫描
-    decision_gate._scan_account_like({"reconciliation": recon_sub, "preview": preview_sub},
+    decision_gate._scan_account_like({"reconciliation": recon_sub, "review": review_sub},
                                      violations)
+
+    _check_snapshot_coverage(payload.get("account"), violations)
+    _check_execution_window(current, policy, prop, violations)
 
     # limit_day 必须带限价，market_day 不得带（P4 修复）
     limit_price = prop.get("limit_price")
@@ -299,14 +386,7 @@ def evaluate(payload, policy, today=None, skip_keychain=False, state=None):
     elif limit_price is not None:
         violations.append("limit_price_forbidden_for_market_order")
 
-    # mandate 额度（风险退出卖单豁免）
     amount = prop.get("amount")
-    if mandate and _is_finite_number(amount) and not is_risk_exit:
-        if amount > mandate["max_order_amount"] + 1e-9:
-            violations.append("mandate_order_amount_exceeded")
-        turnover = merged_hist.get("turnover_today")
-        if _is_finite_number(turnover) and turnover + amount > mandate["max_daily_turnover"] + 1e-9:
-            violations.append("mandate_daily_turnover_exceeded")
 
     # 对账
     check_reconciliation(recon_sub, violations)
@@ -315,9 +395,11 @@ def evaluate(payload, policy, today=None, skip_keychain=False, state=None):
     if halted and not is_risk_exit:
         violations.append("halt_active")
 
-    # post_preview 校验（含提案绑定与重放检测）
-    if phase == "post_preview":
-        check_preview(preview_sub, policy, prop, used_preview_ids, violations)
+    # post_review 校验（与当前 Robinhood review 工具契约一致）
+    review_fingerprint = None
+    if phase == "post_review":
+        review_fingerprint = check_review(
+            review_sub, policy, prop, used_review_fingerprints, violations, now=now)
 
     # 回撤断路器
     halt_required = False
@@ -329,25 +411,19 @@ def evaluate(payload, policy, today=None, skip_keychain=False, state=None):
     violations = list(dict.fromkeys(violations))
     would_allow = not violations
     result = {
-        "mode": mode,
         "phase": phase,
         "would_allow": would_allow,
         "halt_required": halt_required,
         "decision_key": base.get("decision_key"),
         "violations": violations,
         "derived": derived,
-        "mandate_status": mandate_reason,
-        "can_preview": False,
+        "can_review": False,
         "can_submit": False,
     }
-    if mandate:
-        result["derived"]["mandate_expires_at_et"] = mandate["expires_at_et"]
-    if mode == "shadow":
-        result["shadow_would_allow"] = would_allow
-        return result
-    if would_allow and phase == "pre_preview":
-        result["can_preview"] = True
-    if would_allow and phase == "post_preview":
+    if would_allow and phase == "pre_review":
+        result["can_review"] = True
+    if would_allow and phase == "post_review":
+        ref_id = str(uuid.uuid4())
         result["can_submit"] = True
         result["approved_intent"] = {
             "symbol": prop.get("symbol"),
@@ -358,25 +434,26 @@ def evaluate(payload, policy, today=None, skip_keychain=False, state=None):
             "limit_price": limit_price,
             "trigger": prop.get("trigger"),
             "decision_key": base.get("decision_key"),
-            "preview_id": (preview_sub or {}).get("preview_id"),
-            "quoted_price": (preview_sub or {}).get("quoted_price"),
-            "client_key_required": True,
+            "quantity": prop.get("quantity"),
+            "market_hours": "regular_hours",
+            "time_in_force": "gfd",
+            "review_fingerprint": review_fingerprint,
+            "ref_id": ref_id,
+            "requires_explicit_confirmation": False,
         }
+        result["required_market_data_disclosure"] = (review_sub or {}).get(
+            "response", {}).get("market_data_disclosure")
     return result
 
 
 def check_runtime(policy):
     halted = check_halt(policy)
-    mandate, reason = load_mandate(policy)
     report = {
         "halt_active": halted,
-        "mandate_status": reason,
-        "mode_if_run_now": "live" if mandate else "shadow",
+        "trading_enabled_by_policy": not halted,
         "policy_version": policy.get("policy_version"),
         "note": "HALT 存在时仅允许风险退出卖单" if halted else None,
     }
-    if mandate:
-        report["mandate_expires_at_et"] = mandate["expires_at_et"]
     print(json.dumps(report, ensure_ascii=False))
     sys.exit(0)
 
@@ -406,36 +483,53 @@ def main():
     except Exception as exc:  # noqa: BLE001
         _fail([f"input_error:{type(exc).__name__}"])
 
-    date_et = str(payload.get("as_of_et", ""))[:10]
-    state, state_status = load_state(policy["gate_state_file"], date_et)
-    if state_status != "ok":
-        _fail(["gate_state_corrupt"], phase=str(payload.get("phase")))
+    # CLI 运行不信任调用方自报的 local_intents；以本地持久 ledger 为准。
     try:
-        result = evaluate(payload, policy, state=state)
+        import order_ledger
+        recon = payload.get("reconciliation")
+        if not isinstance(recon, dict):
+            _fail(["missing_reconciliation"], phase=str(payload.get("phase")))
+        recon["local_intents"] = order_ledger.read_projection(policy["order_ledger_file"])
+    except SystemExit:
+        raise
     except Exception as exc:  # noqa: BLE001
-        _fail([f"gate_internal_error:{type(exc).__name__}"], phase=str(payload.get("phase")))
+        _fail([f"order_ledger_error:{type(exc).__name__}"], phase=str(payload.get("phase")))
 
-    # P5 修复：断路器自锁——halt_required 时闸门自己写 HALT（幂等），不依赖 runner 履约
-    if result.get("halt_required"):
+    date_et = str(payload.get("as_of_et", ""))[:10]
+    state_path = _expand(policy["gate_state_file"])
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+") as lock_fh:
+        # 必须把 load + evaluate + reserve 放在同一把锁里，否则并发唤醒可绕过频次门。
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        state, state_status = load_state(policy["gate_state_file"], date_et)
+        if state_status != "ok":
+            _fail(["gate_state_corrupt"], phase=str(payload.get("phase")))
         try:
-            write_halt(policy)
-        except Exception:  # noqa: BLE001
-            result["violations"].append("halt_write_failed")
-            result["would_allow"] = False
-            result["can_preview"] = False
-            result["can_submit"] = False
-    # 批准提交即入本地账本（幂等/频次的闸门侧真相）
-    if result.get("can_submit"):
-        try:
-            record_submission(state, result["decision_key"],
-                              result["approved_intent"].get("preview_id"),
-                              result["approved_intent"].get("amount"))
-            save_state(policy["gate_state_file"], state)
-        except Exception:  # noqa: BLE001
-            result["can_submit"] = False
-            result["would_allow"] = False
-            result["violations"].append("gate_state_write_failed")
+            result = evaluate(payload, policy, state=state)
+        except Exception as exc:  # noqa: BLE001
+            _fail([f"gate_internal_error:{type(exc).__name__}"], phase=str(payload.get("phase")))
 
+        if result.get("halt_required"):
+            try:
+                write_halt(policy)
+            except Exception:  # noqa: BLE001
+                result["violations"].append("halt_write_failed")
+                result["would_allow"] = False
+                result["can_review"] = False
+                result["can_submit"] = False
+        # post_review 批准时预留 ref_id 并消耗该回执。
+        if result.get("can_submit"):
+            try:
+                intent = result["approved_intent"]
+                record_submission(state, result["decision_key"],
+                                  intent["review_fingerprint"], intent["amount"],
+                                  intent["ref_id"])
+                save_state(policy["gate_state_file"], state)
+            except Exception:  # noqa: BLE001
+                result["violations"].append("gate_state_write_failed")
+                result["would_allow"] = False
+                result["can_submit"] = False
     print(json.dumps(result, ensure_ascii=False))
     sys.exit(0 if result["would_allow"] else 1)
 

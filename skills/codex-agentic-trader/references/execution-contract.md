@@ -1,115 +1,155 @@
-# 执行契约（live_gate.py 的输入输出与两阶段流程）
+# Robinhood 执行契约（2026-08-13）
 
-## 1. 两阶段流程总览
+本契约与当前 Robinhood MCP 的 `review_equity_order` / `place_equity_order` / `get_equity_orders` / `cancel_equity_order` 对齐。工具契约发生变化时必须 fail-closed，不得靠字段猜测兼容。
 
+## 1. 固定流程
+
+```text
+fresh account + positions + orders + fills + market snapshot
+  -> phase=pre_review -> live_gate
+  -> can_review=true -> review_equity_order
+  -> refresh all mutable state
+  -> phase=post_review -> live_gate binds actual request/response
+  -> can_submit=true
+  -> place_equity_order with the bound arguments and ref_id
+  -> get_equity_orders(order_id=...) until terminal
 ```
-决策 JSON（phase=pre_preview）
-  → live_gate：mandate/HALT/对账/市场状态/回撤/仓位/频次/准入 全检
-  → can_preview=true 才调券商 preview（shadow 模式到此为止，记 shadow_would_allow）
-  → preview 回执并入 JSON（phase=post_preview，账户与行情必须刷新）
-  → live_gate 复检 + preview 校验
-  → can_submit=true → 提交与 intent 完全一致的订单（独立 client key）
-  → 按订单 ID 查询至终态；accepted/queued ≠ fill
-```
 
-## 2. 输入 JSON（在 roy-trading-desk 决策契约基础上扩展）
+`can_submit=true` 只表示该笔已通过当轮账户、风控、对账和 Robinhood 审核绑定。如平台另行要求确认、披露确认或返回实质性警告，必须停止，不得绕过。
 
-基础字段（schema_version/as_of_et/data_age_seconds/account/market_state/history/proposal 及 declares）见本目录 [decision-card.md](decision-card.md)（基础契约），扩展以下字段：
+## 2. 决策输入
+
+基础字段见 [decision-card.md](decision-card.md)。执行层另要求：
 
 ```json
 {
-  "phase": "pre_preview",
-  "reconciliation": {
-    "local_intents": [
-      {"client_key": "<uuid>", "status": "filled"}
+  "schema_version": "1.0",
+  "phase": "pre_review",
+  "as_of_et": "2026-08-13T15:40:00-04:00",
+  "data_age_seconds": 120,
+  "account": {
+    "account_type": "cash",
+    "margin_enabled": false,
+    "strategy_external_capital": 5000,
+    "equity": 5000,
+    "cash_available_settled": 1500,
+    "broker_buying_power": 1500,
+    "unleveraged_buying_power": 1500,
+    "peak_equity_adjusted": 5200,
+    "positions": [
+      {"symbol": "VTI", "value": 2000, "sellable_value": 2000, "asset_class": "etf"}
     ],
-    "broker_orders": [
-      {"client_key": "<uuid>", "status": "filled"}
-    ]
+    "open_orders": [
+      {"order_id": "<broker-order-id>", "symbol": "QQQM", "side": "buy", "asset_class": "etf", "remaining_notional": 100}
+    ],
+    "coverage": {
+      "positions_complete": true,
+      "open_equity_orders_complete": true,
+      "today_equity_orders_complete": true,
+      "today_fills_complete": true,
+    "advanced_orders_checked": false
+    }
   },
-  "preview": null
+  "reconciliation": {
+    "local_intents": [{"order_id": "<broker-order-id>", "status": "queued"}],
+    "broker_orders": [{"order_id": "<broker-order-id>", "status": "queued", "placed_agent": "agentic"}]
+  },
+  "review": null,
+  "market_state": {"benchmark_a_pass": true, "benchmark_b_pass": true},
+  "history": {"orders_today": 1, "turnover_today": 300, "used_decision_keys": []},
+  "proposal": {"...": "see decision-card.md"}
 }
 ```
 
-- `mode` 字段不存在——模式由闸门根据 mandate 状态推导，会话无权声明。
-- `reconciliation`：本地 intent 台账与券商**当日+未完成**订单全集。规则：
-  - 每个本地非终态 intent 必须能在 broker_orders 找到同 client_key；
-  - 每个 broker_order 的 client_key 必须存在于本地台账；
-  - `status` 只认 `open|partially_filled|filled|cancelled|rejected|unknown`；
-  - 任何不匹配或 `unknown` → `reconciliation_mismatch`，拒绝新单（撤单/查询不受限）。
-- `phase=post_preview` 时 `preview` 必填，且**必须携带提案回显字段**（2026-08-13 对抗审查 P1 修复）：
+注意：
+
+- `cash_available_settled` 必须是现金账户的 `unleveraged_buying_power`，不是账面 cash。
+- 持仓卖出上限用 `shares_available_for_sells * fresh quote`，不用总 quantity。
+- `open_orders.remaining_notional` 必须含未成交剩余；闸门会把挂单纳入现金、仓位、单股和单标的限制。
+- `advanced_orders_checked` 必须忠实记录当轮覆盖情况。连接器未提供独立高级订单工具时填 false，不得伪造为 true；股票订单仍必须通过 `get_equity_orders` 全分页对账。
+- 完整账号不在此 JSON 中。
+
+## 3. proposal 的订单表示
+
+### 市价 DAY
 
 ```json
 {
-  "preview": {
-    "preview_id": "<券商返回>",
-    "preflight_status": "clean",
-    "warnings": [],
-    "quoted_price": 25.05,
-    "preview_age_seconds": 30,
-    "symbol": "ABCD",
-    "side": "buy",
-    "amount": 500.0
+  "amount": 500,
+  "quantity": null,
+  "limit_price": null,
+  "order_type": "market_day"
+}
+```
+
+映射到 Robinhood：`type=market`, `dollar_amount="500.00"`, `market_hours=regular_hours`, `time_in_force=gfd`。
+
+### 限价 DAY
+
+```json
+{
+  "amount": 500,
+  "quantity": 20,
+  "limit_price": 25,
+  "order_type": "limit_day"
+}
+```
+
+映射到 Robinhood：`type=limit`, `quantity="20"`, `limit_price="25"`, `market_hours=regular_hours`, `time_in_force=gfd`。`amount` 必须与 quantity * limit_price 在 $0.01 内一致。Robinhood 限价单不支持只传美元金额。
+
+## 4. post_review 包络
+
+```json
+{
+  "phase": "post_review",
+  "review": {
+    "observed_at_et": "2026-08-13T15:41:30-04:00",
+    "request": {
+      "symbol": "ABCD",
+      "side": "buy",
+      "type": "market",
+      "dollar_amount": "500.00",
+      "market_hours": "regular_hours",
+      "time_in_force": "gfd"
+    },
+    "response": {
+      "symbol": "ABCD",
+      "side": "buy",
+      "type": "market",
+      "dollar_amount": "500.00",
+      "order_checks": {},
+      "market_data_disclosure": "<Robinhood disclosure, preserved verbatim>",
+      "quote_data": {
+        "symbol": "ABCD",
+        "state": "active",
+        "has_traded": true,
+        "bid_price": "25.00",
+        "ask_price": "25.02"
+      }
+    }
   }
 }
 ```
 
-  校验：`preflight_status` 恰为 `clean`、`warnings` 为空数组、`preview_age_seconds ≤ policy.max_preview_age_seconds`、`quoted_price` 为正有限数；**`symbol`/`side`/`amount` 必须与 proposal 逐字段一致**（金额容差 $0.01）——陈旧或无关回执过不了闸门；**`preview_id` 一次性消费**——出现在闸门状态账本或 `history.used_preview_ids` 中即拒（`preview_replayed`）。任何不满足 = 拒绝，无二次机会（重新走 pre_preview）。
-- `order_type=limit_day` 时 proposal 必须带 `limit_price`（正有限数）；`market_day` 不得带（P4 修复）。
-- mandate 到期日按严格 ISO 日历解析（`date.fromisoformat`），任何非规范串（`2026-13-45`、空格补位等）一律视为过期（P3 修复）。
+闸门校验 request/response/proposal 一致、时效、`order_checks == {}`、披露非空、标的 active/has_traded、买卖价有效以及价差不超 policy。完整 review 规范化哈希作为一次性指纹。
 
-## 2b. 闸门状态账本（P2 修复）
+Robinhood 的实际回执没有 `preview_id`、`preflight_status`、`warnings` 或 `quoted_price`。任何使用这些旧字段的实现都与当前契约不兼容。
 
-闸门在 `policy.gate_state_file` 维护当日已批订单的本地账本（decision_key / preview_id / amount）。评估时**频次、换手、幂等、preview 重放取「调用方声明 ∪ 账本」的更严值**——调用方谎报 `orders_today=0` 也压不掉账本里的真实计数。CLI 路径每次 `can_submit=true` 自动入账；账本损坏 = `gate_state_corrupt` 拒绝。换 ET 日期自动清零。账本仍是同用户文件（诚实边界同 §6），但它把"逐次调用各自自证"收敛为"闸门单点记账"。
+## 5. 订单提交与幂等
 
-## 2c. HALT 语义（P5 修复）
+- 每个逻辑订单首次提交生成一个 UUID `ref_id`。
+- 传输超时时保留该 UUID；不得把未知当拒绝后换 UUID 重下。
+- Robinhood `get_equity_orders` 不对外回显 `ref_id`。因此本地 ledger 必须在 place 成功回执时永久绑定 `ref_id -> order.id`；后续对账以 `order.id` 为准。
+- 未得到 place 回执的超时只能标记 `submission_unknown`，停止新单并人工核对。
 
-- HALT 文件存在：只放行**风险退出卖单**（`side=sell` 且 trigger ∈ risk_exit_triggers，即 hard-boundaries §4 的清仓通道），其余提案一律 `halt_active` 拒绝。
-- 回撤触及最深档：闸门输出 `halt_required=true` 且 **CLI 路径自动创建 HALT 文件（自锁）**，不再依赖 runner 履约；HALT 解除仍只能 Roy 手动删文件。
+## 6. 状态集
 
-## 3. 输出
+活动：`new`, `queued`, `confirmed`, `unconfirmed`, `partially_filled`, `pending_cancelled`, `locating`。
 
-```json
-{
-  "mode": "live",
-  "phase": "pre_preview",
-  "would_allow": true,
-  "can_preview": true,
-  "can_submit": false,
-  "halt_required": false,
-  "decision_key": "<sha256>",
-  "violations": [],
-  "derived": {"...": "同 roy-trading-desk，另含 mandate_remaining_days 等"},
-  "approved_intent": {"symbol": "...", "side": "...", "amount": 0.0, "asset_class": "...", "order_type": "market_day", "limit_price": null, "trigger": "...", "decision_key": "<sha256>", "preview_id": "<回执ID>", "quoted_price": 0.0, "client_key_required": true}
-}
-```
+终态：`filled`, `cancelled`, `rejected`, `failed`, `voided`, `partially_filled_rest_cancelled`, `locate_failed`。
 
-- `shadow` 模式：`can_preview`/`can_submit` 恒 false，放行判定记在 `shadow_would_allow`。
-- `live + pre_preview`：最多给 `can_preview=true`。
-- `live + post_preview`：全部通过才 `can_submit=true`，同时回显 `approved_intent`；提交内容必须与之逐字段一致。
-- `halt_required=true`：回撤触及最深档。运行方职责（闸门管不到执行侧，必须由 runner 完成）：
-  1. 立即 `touch <policy.halt_file>`；
-  2. 仅允许提交风险退出卖单（trigger=drawdown_action，仍走两阶段）；
-  3. 日报置顶报告。
+未来出现任何未知状态时一律 fail-closed，先更新契约与回归测试。
 
-## 4. mandate 文件契约（mandate_admin.py 管理）
+## 7. 中止与 HALT
 
-```json
-{
-  "mandate_version": "1.0",
-  "account_last4": "0000",
-  "issued_at_et": "2026-08-13",
-  "expires_at_et": "2026-09-12",
-  "max_order_amount": 600.0,
-  "max_daily_turnover": 1500.0,
-  "confirmation": "I AUTHORIZE LIVE TRADING 0000"
-}
-```
-
-- 生效条件：文件存在且 0600 权限、未过期、`account_last4` 与 policy 一致、confirmation 语句完全匹配、（macOS）Keychain 中的 sha256 与文件当前内容一致。
-- 校验和存 Keychain 的目的是**漂移检测**（文件被改动即失效），不是密码学防篡改——同用户 shell 可以两处一起改，诚实边界见 hard-boundaries §6。
-- mandate 上限与 policy 上限取更严者（例：mandate `max_order_amount=600` 会把单笔压到 ≤$600，即使 policy 允许更大）。
-
-## 5. decision_key 与幂等
-
-`decision_key = sha256(ET日期|symbol|side|trigger|amount.2f)`，与 used_decision_keys 查重；此外每笔提交必须使用独立 `client_key`（UUID），重试必须复用原 client_key。decision_key 防手滑，client_key + 券商对账防重复提交——两层都在才算幂等。
+HALT 阻止一切新增风险的 review/place。对已有持仓的 `drawdown_action` / `thesis_break` 卖出提案，仍必须通过新鲜账户快照、对账和 Robinhood 审核。
