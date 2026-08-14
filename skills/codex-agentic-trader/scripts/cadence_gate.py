@@ -32,6 +32,23 @@ def _finite_nonnegative(value):
         and math.isfinite(value) and value >= 0
 
 
+def _scheduled_slot(now, tolerance_minutes):
+    """将实际唤醒时间归一到最近一个已到达的 :00/:30 逻辑时段。
+
+    只接受调度器的有界迟到，从不提前触发未来时段。容差必须小于
+    半小时，保证一次唤醒最多映射到一个逻辑时段。
+    """
+    if not isinstance(tolerance_minutes, int) or isinstance(tolerance_minutes, bool) \
+            or not 0 <= tolerance_minutes < 30:
+        raise ValueError("schedule_late_tolerance_minutes_invalid")
+    slot_minute = 30 if now.minute >= 30 else 0
+    slot = now.replace(minute=slot_minute, second=0, microsecond=0)
+    delay_seconds = int((now - slot).total_seconds())
+    if delay_seconds > tolerance_minutes * 60:
+        return None, None
+    return slot, delay_seconds
+
+
 def evaluate(payload, policy=None):
     policy = policy or load_policy()
     now = _parse_et(payload.get("as_of_et"), policy["market_timezone"])
@@ -46,9 +63,15 @@ def evaluate(payload, policy=None):
     bp_verified = _finite_nonnegative(bp)
     threshold = policy["min_order_amount"] + policy["min_cash_buffer"]
     sufficient = bp_verified and bp >= threshold
-    hm = (now.hour, now.minute)
+    tolerance = policy["decision_cadence"]["schedule_late_tolerance_minutes"]
+    scheduled, delay_seconds = _scheduled_slot(now, tolerance)
+    hm = ((scheduled.hour, scheduled.minute) if scheduled else None)
     result = {
         "as_of_et": now.isoformat(),
+        "scheduled_for_et": scheduled.isoformat() if scheduled else None,
+        "cadence_slot_id": scheduled.isoformat() if scheduled else None,
+        "schedule_delay_seconds": delay_seconds,
+        "schedule_late_tolerance_minutes": tolerance,
         "action": "none",
         "full_analysis": False,
         "operation_decision": False,
@@ -89,9 +112,11 @@ def evaluate(payload, policy=None):
                       reason="post_close_reconciliation_only")
         return result
 
-    in_regular_window = time(9, 30) <= now.time().replace(tzinfo=None) <= time(16, 0)
-    on_half_hour = now.minute in (0, 30)
-    if not (in_regular_window and on_half_hour):
+    if scheduled is None:
+        return result
+    in_regular_window = (time(9, 30) <= scheduled.time().replace(tzinfo=None)
+                         <= time(16, 0))
+    if not in_regular_window:
         return result
 
     if urgent:
@@ -106,7 +131,7 @@ def evaluate(payload, policy=None):
                       reason="sufficient_buying_power_30m_cadence")
         return result
 
-    two_hour_slot = now.minute == 0 and now.hour in (10, 12, 14, 16)
+    two_hour_slot = scheduled.minute == 0 and scheduled.hour in (10, 12, 14, 16)
     if two_hour_slot:
         result.update(action="operation_decision", operation_decision=True,
                       trade_permitted_by_cadence=bp_verified,

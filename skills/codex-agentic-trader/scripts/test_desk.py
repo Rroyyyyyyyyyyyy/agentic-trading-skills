@@ -275,7 +275,7 @@ class JournalTests(unittest.TestCase):
 
     def test_masked_ref(self):
         row = journal_append.append(self.log, {"type": "decision",
-            "account_ref_masked": "****9690"})
+            "account_ref_masked": "****0000"})
         self.assertEqual(row["seq"], 0)
 
     def test_unknown_event_type(self):
@@ -294,9 +294,10 @@ class BehaviorTests(unittest.TestCase):
 
 
 class CadenceTests(unittest.TestCase):
-    def row(self, clock, buying_power=100.0, trading=True, urgent=False):
+    def row(self, clock, buying_power=100.0, trading=True, urgent=False,
+            seconds="00"):
         return cadence_gate.evaluate({
-            "as_of_et": f"2026-08-13T{clock}:00-04:00",
+            "as_of_et": f"2026-08-13T{clock}:{seconds}-04:00",
             "is_trading_day": trading,
             "unleveraged_buying_power": buying_power,
             "urgent_risk_event": urgent,
@@ -332,6 +333,46 @@ class CadenceTests(unittest.TestCase):
         result = self.row("12:00", buying_power=100.0, trading=False)
         self.assertFalse(result["operation_decision"])
         self.assertFalse(result["trade_permitted_by_cadence"])
+
+    def test_two_minute_late_wakeup_uses_noon_slot(self):
+        result = self.row("12:02", buying_power=12.26)
+        self.assertEqual(result["action"], "operation_decision")
+        self.assertEqual(result["reason"], "insufficient_buying_power_2h_cadence")
+        self.assertEqual(result["scheduled_for_et"],
+                         "2026-08-13T12:00:00-04:00")
+        self.assertEqual(result["schedule_delay_seconds"], 120)
+
+    def test_late_wakeup_never_maps_to_future_slot(self):
+        result = self.row("11:59", buying_power=12.26)
+        self.assertEqual(result["action"], "none")
+        self.assertIsNone(result["scheduled_for_et"])
+
+    def test_wakeup_outside_tolerance_is_skipped(self):
+        result = self.row("12:06", buying_power=12.26)
+        self.assertEqual(result["action"], "none")
+        self.assertIsNone(result["cadence_slot_id"])
+
+    def test_slot_id_is_stable_inside_tolerance(self):
+        first = self.row("12:01", buying_power=12.26)
+        retry = self.row("12:04", buying_power=12.26)
+        self.assertEqual(first["cadence_slot_id"], retry["cadence_slot_id"])
+
+    def test_close_analysis_accepts_bounded_lateness(self):
+        close = self.row("17:32", trading=False)
+        self.assertEqual(close["action"], "full_close_analysis")
+        self.assertTrue(close["send_daily_report"])
+
+    def test_invalid_tolerance_fails_closed(self):
+        policy = copy.deepcopy(POLICY)
+        policy["decision_cadence"]["schedule_late_tolerance_minutes"] = 30
+        with self.assertRaisesRegex(ValueError,
+                                    "schedule_late_tolerance_minutes_invalid"):
+            cadence_gate.evaluate({
+                "as_of_et": "2026-08-13T12:02:00-04:00",
+                "is_trading_day": True,
+                "unleveraged_buying_power": 12.26,
+                "urgent_risk_event": False,
+            }, policy)
 
 
 class PerformanceReviewTests(unittest.TestCase):

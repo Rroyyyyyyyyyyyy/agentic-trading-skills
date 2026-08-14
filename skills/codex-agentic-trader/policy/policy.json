@@ -1,5 +1,5 @@
 {
-  "policy_version": "3.3-20260813-daily-alpha-controlled-offense",
+  "policy_version": "3.4-20260814-cadence-late-tolerance",
   "note": "唯一策略参数源，只有账户所有人能在代码审查后修改。用户体验只有一条自动流程；内部仍必须完成账户、订单、审核与风控核对。",
   "account_last4": "0000",
   "capital_cap": 5000.0,
@@ -41,7 +41,8 @@
   },
   "decision_cadence": {
     "sufficient_buying_power_minutes": 30,
-    "insufficient_buying_power_minutes": 120
+    "insufficient_buying_power_minutes": 120,
+    "schedule_late_tolerance_minutes": 5
   },
   "market_timezone": "America/New_York",
   "max_data_age_seconds": 300,
