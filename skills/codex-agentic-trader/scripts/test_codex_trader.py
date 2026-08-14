@@ -294,6 +294,23 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("每日目标", skill)
         self.assertIn("controlled_offense", skill)
 
+    def test_progressive_candidate_research_contract(self):
+        root = Path(__file__).parents[1]
+        policy = json.loads((root / "policy" / "policy.json").read_text())
+        research = policy["candidate_research"]
+        self.assertEqual(research["progressive_screen_counts"], [10, 20, 40, 60, 100])
+        self.assertEqual(research["deep_review_limit"], 12)
+        self.assertEqual(research["persistent_watchlist_limit"], 12)
+        self.assertTrue(research["watchlist_recheck_every_full_decision"])
+        self.assertFalse(research["reset_after_qualified_candidate"])
+        self.assertEqual(research["rotation_new_symbols_at_max_screen"], 20)
+        self.assertFalse(research["no_candidate_is_trade_trigger"])
+        skill = (root / "SKILL.md").read_text()
+        playbook = (root / "references" / "research-playbook.md").read_text()
+        self.assertIn("10→20→40→60→100", skill)
+        self.assertIn("递进式候选池与持续监控", playbook)
+        self.assertIn("扩大的是研究覆盖", skill)
+
 
 class RuntimeScopeTests(unittest.TestCase):
     def config(self, tools=None):
